@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback, useMemo, type DragEvent } from "react";
+import { startTransition, useState, useRef, useEffect, useCallback, useMemo, type DragEvent } from "react";
 import {
   Upload,
   RulerDimensionLine,
@@ -1922,12 +1922,15 @@ export default function FloorPlanEditor() {
       data: any,
       name?: string,
       defaults?: { ceilingHeightIn?: number; defaultDoorHeightIn?: number },
+      floorIndex?: 1 | 2,
     ): FloorSnapshot => {
       const planPxPerFoot = data.metadata?.px_per_foot ?? pixelsPerFoot;
+      const floorIdPrefix = floorIndex ? `f${floorIndex}_` : "";
       const snapFloors: Floor[] = (data.floors || []).map((f: any) => ({
         ...f,
-        id: f.id || generateId("floor"),
+        id: `${floorIdPrefix}${f.id || generateId("floor")}`,
       }));
+
       const snapWalls: Wall[] = (data.walls || []).map((w: any) => ({
         ...w,
         id: w.id || generateId("wall"),
@@ -2470,14 +2473,18 @@ export default function FloorPlanEditor() {
   const deleteSelectedItem = () => {
     if (!selectedId) return;
     pushHistory();
-    setFloors((p) => p.filter((f) => f.id !== selectedId));
-    setWalls((p) => p.filter((w) => w.id !== selectedId));
-    setDoors((p) => p.filter((d) => d.id !== selectedId));
-    setWindows((p) => p.filter((w) => w.id !== selectedId));
-    setFurniture((p) => p.filter((f) => f.id !== selectedId));
-    setTexts((p) => p.filter((t) => t.id !== selectedId));
-    setStructures((p) => p.filter((s) => s.id !== selectedId));
-    setSelectedId(null);
+    // Non-blocking: React can interrupt the 3D-tree reconciliation for pointer
+    // events while the deletion propagates through the memoized mesh graph.
+    startTransition(() => {
+      setFloors((p) => p.filter((f) => f.id !== selectedId));
+      setWalls((p) => p.filter((w) => w.id !== selectedId));
+      setDoors((p) => p.filter((d) => d.id !== selectedId));
+      setWindows((p) => p.filter((w) => w.id !== selectedId));
+      setFurniture((p) => p.filter((f) => f.id !== selectedId));
+      setTexts((p) => p.filter((t) => t.id !== selectedId));
+      setStructures((p) => p.filter((s) => s.id !== selectedId));
+      setSelectedId(null);
+    });
   };
 
   useEffect(() => {
@@ -3062,7 +3069,7 @@ export default function FloorPlanEditor() {
           const closeDistWorld = 12 / viewport.zoom;
           if (Math.hypot(fx - start.x, fy - start.y) <= closeDistWorld) {
             pushHistory();
-            const newId = generateId("floor");
+            const newId = `f${activeFloor}_${generateId("floor")}`;
             setFloors((prev) => [...prev, { id: newId, polygon: [...roomDraft] }]);
             setRoomDraft([]);
             setSelectedId(newId);
@@ -6282,6 +6289,8 @@ export default function FloorPlanEditor() {
                     : kind === "floor"
                     ? floors.map((f) => f.id)
                     : walls.map((w) => `baseboard_${w.id}`);
+                
+
 
                 const matToAssignment = (mat: typeof allMaterials[number]) => ({
                   color_url: mat.color_url,
@@ -6293,6 +6302,7 @@ export default function FloorPlanEditor() {
                 const applyMaterial = (mat: typeof allMaterials[number]) =>
                   setVisualMetadata((m) => ({
                     ...m,
+
                     [metadataKey]: {
                       ...m[metadataKey],
                       material: matToAssignment(mat),
@@ -6321,24 +6331,26 @@ export default function FloorPlanEditor() {
                     return { ...m, [metadataKey]: next };
                   });
                 const applyToAll = () => {
+                  const applyEntry = (map: Record<string, any>, id: string) => {
+                    const entry = { ...map[id] };
+                    if (currentMaterial) {
+                      entry.material = currentMaterial;
+                      entry.tile_scale = currentScale;
+                    }
+                    if (currentTint) {
+                      entry.tint = currentTint;
+                    } else {
+                      delete entry.tint;
+                    }
+                    map[id] = entry;
+                  };
                   setVisualMetadata((m) => {
                     const next = { ...m };
-                    for (const id of targetIds) {
-                      const entry = { ...next[id] };
-                      if (currentMaterial) {
-                        entry.material = currentMaterial;
-                        entry.tile_scale = currentScale;
-                      }
-                      if (currentTint) {
-                        entry.tint = currentTint;
-                      } else {
-                        delete entry.tint;
-                      }
-                      next[id] = entry;
-                    }
+                    for (const id of targetIds) applyEntry(next, id);
                     return next;
                   });
                 };
+
                 return (
                   <div className="rounded-md bg-card border border-border p-3 space-y-3">
                     <div className="flex items-center gap-2">
@@ -6537,14 +6549,15 @@ export default function FloorPlanEditor() {
                         );
                       }
                     }
+                    const applyTint = (map: Record<string, any>, id: string) => {
+                      const entry = { ...map[id] };
+                      if (currentTint) entry.tint = currentTint;
+                      else delete entry.tint;
+                      map[id] = entry;
+                    };
                     setVisualMetadata((m) => {
                       const next = { ...m };
-                      for (const id of targetIds) {
-                        const entry = { ...next[id] };
-                        if (currentTint) entry.tint = currentTint;
-                        else delete entry.tint;
-                        next[id] = entry;
-                      }
+                      for (const id of targetIds) applyTint(next, id);
                       return next;
                     });
                   };
@@ -6552,6 +6565,7 @@ export default function FloorPlanEditor() {
                     cat === "door"
                       ? doors.filter((d) => !!d.is_double === isDouble).length
                       : windows.filter((w) => !!w.is_patio === !!selWin?.is_patio).length;
+
 
 
                   return (
@@ -6656,6 +6670,7 @@ export default function FloorPlanEditor() {
               );
             };
             const sameTypeCount = furniture.filter((f) => f.type === selFurn.type).length;
+
             return (
               <section>
                 <h2 className="text-[11px] uppercase tracking-wider text-muted-foreground mb-2 font-semibold">
@@ -7305,6 +7320,47 @@ export default function FloorPlanEditor() {
               visualMetadata={visualMetadata}
               selection={selection3D}
               onSelect={(s) => {
+                if (s) {
+                  const inActive = (() => {
+                    switch (s.kind) {
+                      case "wall":
+                      case "baseboard":
+                        return walls.some((w) => w.id === s.id);
+                      case "floor":
+                        return floors.some((f) => f.id === s.id);
+                      case "door":
+                        return doors.some((d) => d.id === s.id);
+                      case "window":
+                        return windows.some((w) => w.id === s.id);
+                      case "furniture":
+                        return furniture.some((f) => f.id === s.id);
+                      default:
+                        return true;
+                    }
+                  })();
+                  if (!inActive) {
+                    const other: 1 | 2 = activeFloor === 1 ? 2 : 1;
+                    const snap = floorSnapshotsRef.current[other];
+                    const foundInOther = !!snap && (() => {
+                      switch (s.kind) {
+                        case "wall":
+                        case "baseboard":
+                          return snap.walls.some((w: any) => w.id === s.id);
+                        case "floor":
+                          return snap.floors.some((f: any) => f.id === s.id);
+                        case "door":
+                          return snap.doors.some((d: any) => d.id === s.id);
+                        case "window":
+                          return snap.windows.some((w: any) => w.id === s.id);
+                        case "furniture":
+                          return snap.furniture.some((f: any) => f.id === s.id);
+                        default:
+                          return false;
+                      }
+                    })();
+                    if (foundInOther) switchActiveFloor(other);
+                  }
+                }
                 setSelection3D(s);
                 setSelectedId(s?.id ?? null);
               }}
@@ -7328,7 +7384,7 @@ export default function FloorPlanEditor() {
             {(["ALL", 1, 2] as const).map((v) => (
               <button
                 key={String(v)}
-                onClick={() => setVisibleFloor(v)}
+                onClick={() => startTransition(() => setVisibleFloor(v))}
                 className={cn(
                   "px-3 h-8 rounded-lg text-xs font-semibold tracking-wide transition-colors",
                   visibleFloor === v
@@ -7936,15 +7992,16 @@ export default function FloorPlanEditor() {
               const snap1 = buildSnapshotFromPlan(data1, files[0]!.name, {
                 ceilingHeightIn: defaults[0].ceilingHeightIn,
                 defaultDoorHeightIn: defaults[0].defaultDoorHeightIn,
-              });
+              }, 1);
               let snap2: FloorSnapshot | null = null;
               if (count === 2 && files[1]) {
                 const data2 = await readFile(files[1]);
                 snap2 = buildSnapshotFromPlan(data2, files[1].name, {
                   ceilingHeightIn: defaults[1].ceilingHeightIn,
                   defaultDoorHeightIn: defaults[1].defaultDoorHeightIn,
-                });
+                }, 2);
               }
+
               // Infer stair directions when the JSON omits them: F1 stairs
               // default to "UP" and F2 stairs default to "DN" so the Master
               // Stair merge pipeline can pair them.

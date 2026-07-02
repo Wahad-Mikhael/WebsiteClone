@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, Suspense } from "react";
+import { memo, useEffect, useMemo, useState, Suspense } from "react";
 import { useGLTF, Clone, Line } from "@react-three/drei";
 import * as THREE from "three";
 import type { FurnitureItem, Selection3D } from "./FloorPlan3D";
@@ -71,7 +71,10 @@ export function defaultFurnitureModelUrl(
   return (def ?? assets.find((a) => a.category === cat))?.model_url;
 }
 
-function FurnitureInstance({
+const FurnitureInstance = memo(FurnitureInstanceImpl, (a, b) =>
+  a.item === b.item && a.url === b.url && a.selected === b.selected,
+);
+function FurnitureInstanceImpl({
   item,
   url,
   selected,

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, Suspense } from "react";
+import { memo, useEffect, useMemo, useRef, useState, Suspense } from "react";
 import { useGLTF, Line } from "@react-three/drei";
 import * as THREE from "three";
 import { SkeletonUtils } from "three-stdlib";
@@ -165,7 +165,7 @@ function useTintedMaterials(root: THREE.Object3D, tint?: string) {
 
 // ---------- Door ----------
 
-export function DoorInstance({
+function DoorInstanceImpl({
   door,
   url,
   inchToPx,
@@ -279,10 +279,13 @@ export function DoorInstance({
     </group>
   );
 }
+export const DoorInstance = memo(DoorInstanceImpl, (a, b) =>
+  a.door === b.door && a.url === b.url && a.selected === b.selected && a.tint === b.tint && a.inchToPx === b.inchToPx,
+);
 
 // ---------- Window ----------
 
-export function WindowInstance({
+function WindowInstanceImpl({
   win,
   walls,
   url,
@@ -364,6 +367,9 @@ export function WindowInstance({
     </group>
   );
 }
+export const WindowInstance = memo(WindowInstanceImpl, (a, b) =>
+  a.win === b.win && a.walls === b.walls && a.url === b.url && a.ceilingPx === b.ceilingPx && a.selected === b.selected && a.tint === b.tint && a.inchToPx === b.inchToPx,
+);
 
 // Keep `Selection3D` re-exported for callers that import via this module.
 export type { Selection3D };

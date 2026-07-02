@@ -1,12 +1,22 @@
-import { useMemo, useState, useRef, useLayoutEffect, Suspense, useEffect } from "react";
+import { memo, useMemo, useState, useRef, useLayoutEffect, Suspense, useEffect } from "react";
 import { Canvas, useThree, type ThreeEvent } from "@react-three/fiber";
-import { OrbitControls, PerspectiveCamera, Environment, useTexture } from "@react-three/drei";
+import { OrbitControls, PerspectiveCamera, Environment, useTexture, Bvh } from "@react-three/drei";
 import { EffectComposer, N8AO } from "@react-three/postprocessing";
 import * as THREE from "three";
 import LightingSystem from "./LightingSystem";
 import { DoorInstance, WindowInstance, useModelPreload } from "./ModelSystem";
 import { Furniture3D } from "./Furniture3D";
 import type { AssetModel } from "@/lib/assets";
+
+// Shared, module-level default materials. Every wall/floor/ceiling that isn't
+// tinted, textured, hovered, or selected can point at these references so
+// r3f doesn't allocate a fresh MeshStandardMaterial per mesh. Selection/hover
+// states still use inline JSX materials so their emissive can vary per mesh.
+const SHARED_MATERIALS = {
+  wall: new THREE.MeshStandardMaterial({ color: "#e8e3dc", roughness: 0.85, metalness: 0.05 }),
+  floor: new THREE.MeshStandardMaterial({ color: "#c9b89c", roughness: 0.7, metalness: 0.05, side: THREE.DoubleSide }),
+  ceiling: new THREE.MeshStandardMaterial({ color: "#ffffff", transparent: true, opacity: 0, depthWrite: false, side: THREE.DoubleSide, roughness: 1, metalness: 0 }),
+};
 
 export type Pt = { x: number; y: number };
 export type Floor = { id: string; polygon: Pt[] };
@@ -381,7 +391,7 @@ interface FloorMeshProps {
   yOffset: number;
   tint?: string;
 }
-function FloorMesh({ floor, color, material, tileScale, pixelsPerFoot, selected, onClick, yOffset, tint }: FloorMeshProps) {
+function FloorMeshImpl({ floor, color, material, tileScale, pixelsPerFoot, selected, onClick, yOffset, tint }: FloorMeshProps) {
   const geom = useDisposableGeometry(useMemo(() => {
     if (floor.polygon.length < 3) return null;
     const shape = new THREE.Shape();
@@ -411,6 +421,7 @@ function FloorMesh({ floor, color, material, tileScale, pixelsPerFoot, selected,
   const emissive = selected ? "#ff7a18" : hovered ? "#ffb066" : "#000000";
   const emissiveIntensity = selected ? 0.25 : hovered ? 0.18 : 0;
   const fallbackColor = tint ?? color;
+  const useShared = !material && !tint && !selected && !hovered && color === DEFAULT_FLOOR_COLOR;
   return (
     <mesh
       geometry={geom}
@@ -425,12 +436,24 @@ function FloorMesh({ floor, color, material, tileScale, pixelsPerFoot, selected,
         <Suspense fallback={<meshStandardMaterial color={fallbackColor} emissive={emissive} emissiveIntensity={emissiveIntensity} roughness={0.7} metalness={0.05} side={THREE.DoubleSide} />}>
           <TexturedSurface material={material} repeat={repeat} offset={offset} emissive={emissive} emissiveIntensity={emissiveIntensity} hasUv2 tint={tint} />
         </Suspense>
+      ) : useShared ? (
+        <primitive object={SHARED_MATERIALS.floor} attach="material" />
       ) : (
         <meshStandardMaterial color={fallbackColor} emissive={emissive} emissiveIntensity={emissiveIntensity} roughness={0.7} metalness={0.05} side={THREE.DoubleSide} />
       )}
     </mesh>
   );
 }
+const FloorMesh = memo(FloorMeshImpl, (a, b) =>
+  a.floor === b.floor &&
+  a.color === b.color &&
+  a.material === b.material &&
+  a.tileScale === b.tileScale &&
+  a.pixelsPerFoot === b.pixelsPerFoot &&
+  a.selected === b.selected &&
+  a.yOffset === b.yOffset &&
+  a.tint === b.tint,
+);
 
 // THE NEW MATHEMATICAL ENGINE
 // Takes a Start Point (A), an End Point (B), and a Normal, and extrudes the profile perfectly along that path.
@@ -519,7 +542,7 @@ interface WallMeshProps {
   baseboardColor?: string;
   baseboardTileScale?: number;
 }
-function WallMesh({ wall, ceilingPx, inchToPx, doors, windows, color, material, tileScale, pixelsPerFoot, selected, onClick, adjustments, baseboardSelected, onSelectBaseboard, tint, baseboardMaterial, baseboardTint, baseboardColor, baseboardTileScale }: WallMeshProps) {
+function WallMeshImpl({ wall, ceilingPx, inchToPx, doors, windows, color, material, tileScale, pixelsPerFoot, selected, onClick, adjustments, baseboardSelected, onSelectBaseboard, tint, baseboardMaterial, baseboardTint, baseboardColor, baseboardTileScale }: WallMeshProps) {
   const dx = wall.p2.x - wall.p1.x;
   const dy = wall.p2.y - wall.p1.y;
   const length = Math.hypot(dx, dy);
@@ -722,6 +745,8 @@ function WallMesh({ wall, ceilingPx, inchToPx, doors, windows, color, material, 
           <Suspense fallback={<meshStandardMaterial color={tint ?? color} emissive={emissive} emissiveIntensity={emissiveIntensity} roughness={0.85} metalness={0.05} />}>
             <TexturedSurface material={material} repeat={[Math.max(0.05, length / (pixelsPerFoot * 4 * tileScale)), Math.max(0.05, ceilingPx / (pixelsPerFoot * 4 * tileScale))]} emissive={emissive} emissiveIntensity={emissiveIntensity} hasUv2 tint={tint} />
           </Suspense>
+        ) : !tint && !selected && !hovered && color === DEFAULT_WALL_COLOR ? (
+          <primitive object={SHARED_MATERIALS.wall} attach="material" />
         ) : (
           <meshStandardMaterial color={tint ?? color} emissive={emissive} emissiveIntensity={emissiveIntensity} roughness={0.85} metalness={0.05} />
         )}
@@ -745,6 +770,24 @@ function WallMesh({ wall, ceilingPx, inchToPx, doors, windows, color, material, 
     </group>
   );
 }
+const WallMesh = memo(WallMeshImpl, (a, b) =>
+  a.wall === b.wall &&
+  a.ceilingPx === b.ceilingPx &&
+  a.doors === b.doors &&
+  a.windows === b.windows &&
+  a.color === b.color &&
+  a.material === b.material &&
+  a.tileScale === b.tileScale &&
+  a.pixelsPerFoot === b.pixelsPerFoot &&
+  a.selected === b.selected &&
+  a.adjustments === b.adjustments &&
+  a.baseboardSelected === b.baseboardSelected &&
+  a.tint === b.tint &&
+  a.baseboardMaterial === b.baseboardMaterial &&
+  a.baseboardTint === b.baseboardTint &&
+  a.baseboardColor === b.baseboardColor &&
+  a.baseboardTileScale === b.baseboardTileScale,
+);
 
 interface OpeningPlaceholderProps {
   position: Vec3Tuple;
@@ -757,7 +800,7 @@ interface OpeningPlaceholderProps {
   selected: boolean;
   onClick: (e: ThreeEvent<MouseEvent>) => void;
 }
-function OpeningPlaceholder({ position, rotationY, width, height, thickness, yOffset, color, selected, onClick }: OpeningPlaceholderProps) {
+function OpeningPlaceholderImpl({ position, rotationY, width, height, thickness, yOffset, color, selected, onClick }: OpeningPlaceholderProps) {
   const [hovered, setHovered] = useState(false);
   const emissive = selected ? "#ff7a18" : hovered ? "#ffb066" : "#000000";
   const emissiveIntensity = selected ? 0.4 : hovered ? 0.25 : 0;
@@ -775,8 +818,14 @@ function OpeningPlaceholder({ position, rotationY, width, height, thickness, yOf
     </group>
   );
 }
+const OpeningPlaceholder = memo(OpeningPlaceholderImpl, (a, b) =>
+  a.position[0] === b.position[0] && a.position[1] === b.position[1] && a.position[2] === b.position[2] &&
+  a.rotationY === b.rotationY &&
+  a.width === b.width && a.height === b.height && a.thickness === b.thickness &&
+  a.yOffset === b.yOffset && a.color === b.color && a.selected === b.selected,
+);
 
-function CeilingMesh({ polygon, yPx }: { polygon: Pt[]; yPx: number }) {
+function CeilingMeshImpl({ polygon, yPx }: { polygon: Pt[]; yPx: number }) {
   const geom = useDisposableGeometry(useMemo(() => {
     if (!polygon || polygon.length < 3) return null;
     const shape = new THREE.Shape();
@@ -795,18 +844,11 @@ function CeilingMesh({ polygon, yPx }: { polygon: Pt[]; yPx: number }) {
       receiveShadow
       raycast={() => null}
     >
-      <meshStandardMaterial
-        transparent
-        opacity={0}
-        depthWrite={false}
-        side={THREE.DoubleSide}
-        roughness={1}
-        metalness={0}
-        color="#ffffff"
-      />
+      <primitive object={SHARED_MATERIALS.ceiling} attach="material" />
     </mesh>
   );
 }
+const CeilingMesh = memo(CeilingMeshImpl, (a, b) => a.polygon === b.polygon && a.yPx === b.yPx);
 
 type SceneContentsProps = {
   floors: Floor[];
@@ -843,7 +885,7 @@ function SceneContents({ floors, walls, doors, windows, furniture, furnitureAsse
   }, [walls, doors, windows]);
 
   return (
-    <>
+    <Bvh firstHitOnly>
       {floors.map((f: Floor, i: number) => (
         <FloorMesh key={f.id} floor={f} color={visualMetadata[f.id]?.color ?? DEFAULT_FLOOR_COLOR} material={visualMetadata[f.id]?.material} tileScale={visualMetadata[f.id]?.tile_scale ?? 1} pixelsPerFoot={pixelsPerFoot} selected={selection?.kind === "floor" && selection.id === f.id} onClick={() => onSelect({ kind: "floor", id: f.id })} yOffset={i === 0 ? -0.5 : 0} tint={visualMetadata[f.id]?.tint} />
       ))}
@@ -904,7 +946,7 @@ function SceneContents({ floors, walls, doors, windows, furniture, furnitureAsse
           onSelect={onSelect}
         />
       )}
-    </>
+    </Bvh>
   );
 }
 
@@ -1015,7 +1057,7 @@ export default function FloorPlan3D({ floorsData, visibleFloor, furnitureAssets,
           sunIntensity={directionalIntensity}
           ambientIntensity={ambientIntensity}
           windowIntensity={windowIntensity}
-          roomLightIntensity={roomLightIntensity}
+          roomLightIntensity={0}
           nightMode={nightMode}
           sunAzimuthDeg={sunAzimuthDeg}
           sunElevationDeg={sunElevationDeg}
@@ -1025,8 +1067,34 @@ export default function FloorPlan3D({ floorsData, visibleFloor, furnitureAssets,
           {floorsData.map((fd, i) => {
             const floorIdx = (i + 1) as 1 | 2;
             const isVisible = visibleFloor === "ALL" || visibleFloor === floorIdx;
+            if (!isVisible) return null;
+            const ceilPx = inchToPx(fd.ceilingHeightIn);
+            const roomScale = ceilPx * ceilPx * 0.25;
+            const roomEffective = nightMode
+              ? Math.max(roomLightIntensity, 0.6) * roomScale * 1.5
+              : roomLightIntensity * roomScale;
+            const roomColor = nightMode ? "#ffd9a8" : "#ffffff";
             return (
-              <group key={`floor_${i}`} position={[0, stackY[i], 0]} visible={isVisible}>
+              // Hidden floors are fully unmounted so their meshes can't
+              // intercept raycasts on the visible floor beneath them.
+              <group key={`floor_${i}`} position={[0, stackY[i], 0]}>
+                {/* Per-floor ceiling fixture lights (one per room, skipping the building footprint at index 0) */}
+                {fd.floors.slice(1).map((room) => {
+                  let sx = 0, sy = 0;
+                  for (const p of room.polygon) { sx += p.x; sy += p.y; }
+                  const cx = sx / Math.max(1, room.polygon.length);
+                  const cy = sy / Math.max(1, room.polygon.length);
+                  return (
+                    <pointLight
+                      key={`lamp_${room.id}`}
+                      position={[cx, ceilPx - 4, cy]}
+                      intensity={roomEffective}
+                      color={roomColor}
+                      distance={ceilPx * 6}
+                      decay={2}
+                    />
+                  );
+                })}
                 <SceneContents
                   floors={fd.floors}
                   walls={fd.walls}
