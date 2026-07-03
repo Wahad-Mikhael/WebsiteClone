@@ -120,6 +120,15 @@ function FurnitureInstanceImpl({
   const bboxRef = useRef<THREE.Object3D>(null);
   const invalidate = useThree((s) => s.invalidate);
 
+  // Force the shared glass material's shader to recompile for the transparency
+  // pass whenever a new model is mounted. Runs strictly AFTER the new meshes
+  // are attached to the WebGL scene graph, so the renderer picks up transparency
+  // sorting on the first frame instead of rendering opaque.
+  useEffect(() => {
+    SHARED_GLASS_MATERIAL.needsUpdate = true;
+    invalidate();
+  }, [url, invalidate]);
+
   const { nativeSize, nativeCenter } = useMemo(() => {
     const box = new THREE.Box3().setFromObject(scene);
     const s = new THREE.Vector3();

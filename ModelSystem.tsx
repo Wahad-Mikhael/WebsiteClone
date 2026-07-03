@@ -217,6 +217,13 @@ function DoorInstanceImpl({
   const bboxRef = useRef<THREE.Object3D>(null);
   const invalidate = useThree((s) => s.invalidate);
 
+  // Recompile shared glass material shader after new door meshes mount,
+  // so transparency sorting engages on frame 1 for dynamically added models.
+  useEffect(() => {
+    SHARED_GLASS_MATERIAL.needsUpdate = true;
+    invalidate();
+  }, [url, invalidate]);
+
   return (
     <group
       position={[hinge.x, 0, hinge.y]}
@@ -322,6 +329,13 @@ function WindowInstanceImpl({
   const highlightZMul = desiredWorldZ / Math.max(baseSize.z * scaleZ, 1e-3);
   const bboxRef = useRef<THREE.Object3D>(null);
   const invalidate = useThree((s) => s.invalidate);
+
+  // Recompile shared glass material shader after new window meshes mount,
+  // so transparency sorting engages on frame 1 for dynamically added models.
+  useEffect(() => {
+    SHARED_GLASS_MATERIAL.needsUpdate = true;
+    invalidate();
+  }, [url, invalidate]);
 
   return (
     <group
