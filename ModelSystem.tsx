@@ -1,5 +1,6 @@
 import { memo, useEffect, useMemo, useRef, Suspense } from "react";
 import { useGLTF, Line } from "@react-three/drei";
+import { useThree } from "@react-three/fiber";
 import * as THREE from "three";
 import { SkeletonUtils } from "three-stdlib";
 import type { Door, WindowItem, Wall, Selection3D } from "./FloorPlan3D";
@@ -213,6 +214,8 @@ function DoorInstanceImpl({
     };
   }, [scene]);
   const edgePoints = useEdgePoints(highlightSize.size);
+  const bboxRef = useRef<THREE.Object3D>(null);
+  const invalidate = useThree((s) => s.invalidate);
 
   return (
     <group
@@ -220,11 +223,33 @@ function DoorInstanceImpl({
       rotation={[0, rotationY, 0]}
       scale={[scaleX, scaleY, scaleZ]}
       onClick={isInteractive ? (e) => { e.stopPropagation(); onClick(); } : undefined}
-      onPointerOver={isInteractive ? (e) => { e.stopPropagation(); document.body.style.cursor = "pointer"; } : undefined}
-      onPointerOut={isInteractive ? () => { document.body.style.cursor = ""; } : undefined}
+      onPointerOver={isInteractive ? (e) => {
+        e.stopPropagation();
+        document.body.style.cursor = "pointer";
+        if (bboxRef.current) bboxRef.current.visible = true;
+        invalidate();
+      } : undefined}
+      onPointerOut={isInteractive ? () => {
+        document.body.style.cursor = "";
+        if (bboxRef.current) bboxRef.current.visible = false;
+        invalidate();
+      } : undefined}
       raycast={isInteractive ? undefined : () => null}
     >
       <primitive object={cloned} />
+      <Line
+        ref={bboxRef as never}
+        visible={false}
+        points={edgePoints}
+        segments
+        color="#ffb066"
+        lineWidth={3}
+        depthTest={false}
+        renderOrder={999}
+        position={[highlightSize.center.x, highlightSize.center.y, highlightSize.center.z]}
+        toneMapped={false}
+      />
+
       {selected && (
         <Line
           points={edgePoints}
@@ -295,6 +320,8 @@ function WindowInstanceImpl({
   const padInPx = inchToPx(3);
   const desiredWorldZ = wallThickness + padInPx * 2;
   const highlightZMul = desiredWorldZ / Math.max(baseSize.z * scaleZ, 1e-3);
+  const bboxRef = useRef<THREE.Object3D>(null);
+  const invalidate = useThree((s) => s.invalidate);
 
   return (
     <group
@@ -302,11 +329,35 @@ function WindowInstanceImpl({
       rotation={[0, -wallAngle, 0]}
       scale={[scaleX, scaleY, scaleZ]}
       onClick={isInteractive ? (e) => { e.stopPropagation(); onClick(); } : undefined}
-      onPointerOver={isInteractive ? (e) => { e.stopPropagation(); document.body.style.cursor = "pointer"; } : undefined}
-      onPointerOut={isInteractive ? () => { document.body.style.cursor = ""; } : undefined}
+      onPointerOver={isInteractive ? (e) => {
+        e.stopPropagation();
+        document.body.style.cursor = "pointer";
+        if (bboxRef.current) bboxRef.current.visible = true;
+        invalidate();
+      } : undefined}
+      onPointerOut={isInteractive ? () => {
+        document.body.style.cursor = "";
+        if (bboxRef.current) bboxRef.current.visible = false;
+        invalidate();
+      } : undefined}
       raycast={isInteractive ? undefined : () => null}
     >
       <primitive object={cloned} />
+      <group scale={[1, 1, highlightZMul]}>
+        <Line
+          ref={bboxRef as never}
+          visible={false}
+          points={edgePoints}
+          segments
+          color="#ffb066"
+          lineWidth={3}
+        depthTest={false}
+        renderOrder={999}
+          position={[baseCenter.x, baseCenter.y, baseCenter.z / highlightZMul]}
+          toneMapped={false}
+        />
+      </group>
+
       {selected && (
         <group scale={[1, 1, highlightZMul]} position={[0, 0, 0]}>
           <Line

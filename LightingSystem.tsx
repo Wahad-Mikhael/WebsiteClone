@@ -153,12 +153,12 @@ function AmbientFill({ intensity }: { intensity: number }) {
  * of the first floor polygon).
  * ============================================================================= */
 function WindowPortals({
-  windows,
+  windowGroups,
   floors,
   pixelsPerFoot,
   intensity,
 }: {
-  windows: WindowItem[];
+  windowGroups: { windows: WindowItem[]; yOffsetPx: number }[];
   floors: Floor[];
   pixelsPerFoot: number;
   intensity: number;
@@ -173,59 +173,44 @@ function WindowPortals({
 
   return (
     <>
-      {windows.map((w) => {
-        // Inset slightly smaller than the actual window opening so the light
-        // plane never touches the wall geometry on either side. Without this
-        // the rect light clips into the jamb/sill and produces a bright hot
-        // spot on whichever wall it intersects.
-        const INSET = 0.9;
-        const widthPx = w.width * INSET;
-        const heightPx = inchToPx(w.height_in ?? 48) * INSET;
-        const sillPx = inchToPx(w.sill_height_in ?? 36);
+      {windowGroups.map((group, gi) => (
+        <group key={`wpg_${gi}`} position={[0, group.yOffsetPx, 0]}>
+          {group.windows.map((w) => {
+            const INSET = 0.9;
+            const widthPx = w.width * INSET;
+            const heightPx = inchToPx(w.height_in ?? 48) * INSET;
+            const sillPx = inchToPx(w.sill_height_in ?? 36);
 
-        // Wall direction unit vector (in XZ plane, where Z = floor-plan Y).
-        const wx = Math.cos(w.rotation_rad);
-        const wz = Math.sin(w.rotation_rad);
-        // Two candidate inward normals (perpendicular to wall).
-        const nA = { x: -wz, z: wx };
-        const nB = { x: wz, z: -wx };
-        // Pick the one that points toward the interior centroid.
-        const toInteriorX = interior.x - w.center.x;
-        const toInteriorZ = interior.y - w.center.y;
-        const dotA = nA.x * toInteriorX + nA.z * toInteriorZ;
-        const inward = dotA >= 0 ? nA : nB;
+            const wx = Math.cos(w.rotation_rad);
+            const wz = Math.sin(w.rotation_rad);
+            const nA = { x: -wz, z: wx };
+            const nB = { x: wz, z: -wx };
+            const toInteriorX = interior.x - w.center.x;
+            const toInteriorZ = interior.y - w.center.y;
+            const dotA = nA.x * toInteriorX + nA.z * toInteriorZ;
+            const inward = dotA >= 0 ? nA : nB;
 
-        // RectAreaLight emits from its +Z face by default (well, -Z in three).
-        // Easier: position the light just inside the wall and aim it at a
-        // target one unit further inward using a lookAt via group rotation.
-        const cy = sillPx + inchToPx(w.height_in ?? 48) / 2;
-        // Push the light well inside the room. RectAreaLight is double-sided
-        // and has no distance falloff, so even a small overlap with the wall
-        // creates a bright streak. ~1ft inward keeps it cleanly in the room.
-        const offset = pixelsPerFoot;
-        const px = w.center.x + inward.x * offset;
-        const pz = w.center.y + inward.z * offset;
+            const cy = sillPx + inchToPx(w.height_in ?? 48) / 2;
+            const offset = pixelsPerFoot;
+            const px = w.center.x + inward.x * offset;
+            const pz = w.center.y + inward.z * offset;
 
-        // RectAreaLight's "front" is the -Z axis of its local frame. We need
-        // to orient so -Z aligns with the inward normal. Compute the yaw.
-        // No pitch — the window light is purely soft atmospheric sky fill
-        // pushing horizontally into the room. Direct floor pooling is the
-        // sun's job, not the window portal's.
-        // RectAreaLight emits from its +Z face, so add π so +Z faces inward.
-        const yaw = Math.atan2(inward.x, inward.z) + Math.PI; // rotation about Y
+            const yaw = Math.atan2(inward.x, inward.z) + Math.PI;
 
-        return (
-          <rectAreaLight
-            key={w.id}
-            position={[px, cy, pz]}
-            rotation={[0, yaw, 0, "YXZ"]}
-            width={widthPx}
-            height={heightPx}
-            intensity={intensity}
-            color="#cfe3ff"
-          />
-        );
-      })}
+            return (
+              <rectAreaLight
+                key={w.id}
+                position={[px, cy, pz]}
+                rotation={[0, yaw, 0, "YXZ"]}
+                width={widthPx}
+                height={heightPx}
+                intensity={intensity}
+                color="#cfe3ff"
+              />
+            );
+          })}
+        </group>
+      ))}
     </>
   );
 }
@@ -284,31 +269,24 @@ function RoomFixtures({
 export interface LightingSystemProps {
   floors: Floor[];
   walls: Wall[];
-  windows: WindowItem[];
+  /** Windows grouped per floor with their Y offset in world px. */
+  windowGroups: { windows: WindowItem[]; yOffsetPx: number }[];
   ceilingPx: number;
   pixelsPerFoot: number;
-  /** Multiplier for the sun directional light (default 1). */
   sunIntensity?: number;
-  /** Multiplier for the hemisphere fill (default 1). */
   ambientIntensity?: number;
-  /** Per-window rect area light intensity (default 8). */
   windowIntensity?: number;
-  /** Per-room ceiling fixture intensity, daytime baseline (default 0.5). */
   roomLightIntensity?: number;
-  /** When true, room fixtures bump up and warm. */
   nightMode?: boolean;
-  /** Sun azimuth in degrees, 0 = north (-Z), 90 = east (+X). Default 135. */
   sunAzimuthDeg?: number;
-  /** Sun elevation above horizon in degrees, 1-89. Default 55. */
   sunElevationDeg?: number;
-  /** 0 = neutral white sun, 1 = warm golden hour. Default 0.25. */
   sunWarmth?: number;
 }
 
 export default function LightingSystem({
   floors,
   walls,
-  windows,
+  windowGroups,
   ceilingPx,
   pixelsPerFoot,
   sunIntensity = 1,
@@ -337,7 +315,7 @@ export default function LightingSystem({
       />
       <AmbientFill intensity={AMBIENT_BASE * ambientIntensity} />
       <WindowPortals
-        windows={windows}
+        windowGroups={windowGroups}
         floors={floors}
         pixelsPerFoot={pixelsPerFoot}
         intensity={windowIntensity}

@@ -1,5 +1,6 @@
 import { memo, useEffect, useMemo, useRef, Suspense } from "react";
 import { useGLTF, Line } from "@react-three/drei";
+import { useThree } from "@react-three/fiber";
 import * as THREE from "three";
 import { SkeletonUtils } from "three-stdlib";
 import type { FurnitureItem, Selection3D } from "./FloorPlan3D";
@@ -116,6 +117,8 @@ function FurnitureInstanceImpl({
 
   const cloned = useInstanceClone(scene);
   useTintedMaterials(cloned, tint);
+  const bboxRef = useRef<THREE.Object3D>(null);
+  const invalidate = useThree((s) => s.invalidate);
 
   const { nativeSize, nativeCenter } = useMemo(() => {
     const box = new THREE.Box3().setFromObject(scene);
@@ -192,11 +195,33 @@ function FurnitureInstanceImpl({
       rotation={[0, placement.rotY, 0]}
       scale={[scaleX, scaleY, scaleZ]}
       onClick={isInteractive ? (e) => { e.stopPropagation(); onClick(); } : undefined}
-      onPointerOver={isInteractive ? (e) => { e.stopPropagation(); document.body.style.cursor = "pointer"; } : undefined}
-      onPointerOut={isInteractive ? () => { document.body.style.cursor = ""; } : undefined}
+      onPointerOver={isInteractive ? (e) => {
+        e.stopPropagation();
+        document.body.style.cursor = "pointer";
+        if (bboxRef.current) bboxRef.current.visible = true;
+        invalidate();
+      } : undefined}
+      onPointerOut={isInteractive ? () => {
+        document.body.style.cursor = "";
+        if (bboxRef.current) bboxRef.current.visible = false;
+        invalidate();
+      } : undefined}
       raycast={isInteractive ? undefined : () => null}
     >
       <primitive object={cloned} />
+      <Line
+        ref={bboxRef as never}
+        visible={false}
+        points={edgePoints}
+        segments
+        color="#ffb066"
+        lineWidth={3}
+        depthTest={false}
+        renderOrder={999}
+        position={[nativeCenter.x, nativeCenter.y, nativeCenter.z]}
+        toneMapped={false}
+      />
+
       {selected && (
         <Line
           points={edgePoints}

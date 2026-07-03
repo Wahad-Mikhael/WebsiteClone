@@ -7,16 +7,7 @@ import LightingSystem from "./LightingSystem";
 import { DoorInstance, WindowInstance, useModelPreload } from "./ModelSystem";
 import { Furniture3D } from "./Furniture3D";
 import type { AssetModel } from "@/lib/assets";
-
-// Shared, module-level default materials. Every wall/floor/ceiling that isn't
-// tinted, textured, hovered, or selected can point at these references so
-// r3f doesn't allocate a fresh MeshStandardMaterial per mesh. Selection/hover
-// states still use inline JSX materials so their emissive can vary per mesh.
-const SHARED_MATERIALS = {
-  wall: new THREE.MeshStandardMaterial({ color: "#e8e3dc", roughness: 0.85, metalness: 0.05 }),
-  floor: new THREE.MeshStandardMaterial({ color: "#c9b89c", roughness: 0.7, metalness: 0.05, side: THREE.DoubleSide }),
-  ceiling: new THREE.MeshStandardMaterial({ color: "#ffffff", transparent: true, opacity: 0, depthWrite: false, side: THREE.DoubleSide, roughness: 1, metalness: 0 }),
-};
+import { SHARED_MATERIALS, SHARED_HOVER_MATERIALS } from "@/lib/sharedMaterials";
 
 export type Pt = { x: number; y: number };
 export type Floor = { id: string; polygon: Pt[] };
@@ -112,6 +103,12 @@ interface Props {
 
 const DEFAULT_WALL_COLOR = "#e8e3dc";
 const DEFAULT_FLOOR_COLOR = "#c9b89c";
+// Stable module-level raycast references. r3f applies props by assignment;
+// passing `undefined` after `() => null` leaves `mesh.raycast = undefined`,
+// silently disabling intersections. Passing a real function reference both
+// times restores hit-testing when a hidden floor is shown again.
+const DEFAULT_MESH_RAYCAST = THREE.Mesh.prototype.raycast;
+const NULL_RAYCAST = () => null;
 
 // Dispose the previous BufferGeometry when a useMemo replaces it. R3F only
 // auto-disposes on unmount, so a wall/floor whose geometry rebuilds during a
@@ -417,24 +414,47 @@ function FloorMeshImpl({ floor, color, material, tileScale, pixelsPerFoot, selec
     return { repeat: [1 / tilePx, 1 / tilePx], offset: [-minX / tilePx, -minY / tilePx] };
   }, [floor.polygon, pixelsPerFoot, tileScale]);
 
-  // Hover drives emissive via direct material mutation (no React state), so
-  // moving the mouse across a floor doesn't re-render the whole subtree and
-  // doesn't retrigger the geometry useMemo equality checks.
+  // Hover uses direct three.js mutation only — no React state, no memo
+  // invalidation. When the mesh is rendering the shared floor material, we
+  // swap `mesh.material` to the pre-cloned SHARED_HOVER_MATERIALS.floor so
+  // sibling floors that also point at SHARED_MATERIALS.floor stay unlit.
+  // When the mesh has its own per-instance material (tint/textured/fallback),
+  // we mutate that material's emissive directly.
   const matRef = useRef<THREE.MeshStandardMaterial>(null);
+  const meshRef = useRef<THREE.Mesh>(null);
   const invalidate = useThree((s) => s.invalidate);
   const onOver = useCallback((e: ThreeEvent<PointerEvent>) => {
     e.stopPropagation();
-    if (selected || !matRef.current) return;
-    matRef.current.emissive.setHex(0xffb066);
-    matRef.current.emissiveIntensity = 0.18;
+    if (selected) return;
+    const m = meshRef.current;
+    if (!m) return;
+    if (m.material === SHARED_MATERIALS.floor) {
+      m.material = SHARED_HOVER_MATERIALS.floor;
+    } else {
+      const mat = m.material as THREE.MeshStandardMaterial;
+      if (mat && mat.emissive) {
+        mat.emissive.setHex(0xffb066);
+        mat.emissiveIntensity = 0.18;
+      }
+    }
     invalidate();
   }, [selected, invalidate]);
   const onOut = useCallback(() => {
-    if (selected || !matRef.current) return;
-    matRef.current.emissive.setHex(0x000000);
-    matRef.current.emissiveIntensity = 0;
+    if (selected) return;
+    const m = meshRef.current;
+    if (!m) return;
+    if (m.material === SHARED_HOVER_MATERIALS.floor) {
+      m.material = SHARED_MATERIALS.floor;
+    } else {
+      const mat = m.material as THREE.MeshStandardMaterial;
+      if (mat && mat.emissive) {
+        mat.emissive.setHex(0x000000);
+        mat.emissiveIntensity = 0;
+      }
+    }
     invalidate();
   }, [selected, invalidate]);
+
 
   if (!geom) return null;
   const selEmissive = selected ? "#ff7a18" : "#000000";
@@ -443,13 +463,14 @@ function FloorMeshImpl({ floor, color, material, tileScale, pixelsPerFoot, selec
   const useShared = !material && !tint && !selected && color === DEFAULT_FLOOR_COLOR;
   return (
     <mesh
+      ref={meshRef}
       geometry={geom}
       rotation={[Math.PI / 2, 0, 0]}
       position={[0, yOffset, 0]}
       onClick={isInteractive ? (e) => { e.stopPropagation(); onClick(e); } : undefined}
       onPointerOver={isInteractive ? onOver : undefined}
       onPointerOut={isInteractive ? onOut : undefined}
-      raycast={isInteractive ? undefined : () => null}
+      raycast={isInteractive ? DEFAULT_MESH_RAYCAST : NULL_RAYCAST}
       receiveShadow
     >
       {material ? (
@@ -538,7 +559,7 @@ function SweepPieceImpl({ A, B, normal, shape, color, emissive, emissiveIntensit
   const repeatX = Math.max(0.05, length / (ppf * 4 * ts));
 
   return (
-    <mesh geometry={geom} castShadow receiveShadow raycast={() => null}>
+    <mesh geometry={geom} castShadow receiveShadow>
       {material ? (
         <Suspense fallback={<meshStandardMaterial color={tint ?? color} roughness={0.4} metalness={0} emissive={emissive} emissiveIntensity={emissiveIntensity} side={THREE.DoubleSide} />}>
           <TexturedSurface material={material} repeat={[repeatX, 1]} emissive={emissive} emissiveIntensity={emissiveIntensity} hasUv2 tint={tint} />
@@ -771,10 +792,12 @@ function WallMeshImpl({ wall, ceilingPx, inchToPx, doors, windows, color, materi
     return pieces;
   }, [doors, windows, wall, inchToPx]);
 
-  // Ref-based hover: mutate emissive directly instead of triggering re-renders
-  // on every pointer move. Selection state still comes from props.
+  // Hover swaps mesh.material to the shared hover reference when this wall is
+  // untinted/untextured (so sibling walls sharing SHARED_MATERIALS.wall stay
+  // unaffected), otherwise mutates its per-instance material emissive.
   const wallMatRef = useRef<THREE.MeshStandardMaterial>(null);
-  
+  const wallMeshRef = useRef<THREE.Mesh>(null);
+
   const invalidate = useThree((s) => s.invalidate);
   const selEmissive = selected ? "#ff7a18" : "#000000";
   const selEmissiveIntensity = selected ? 0.3 : 0;
@@ -783,26 +806,46 @@ function WallMeshImpl({ wall, ceilingPx, inchToPx, doors, windows, color, materi
 
   const onWallOver = useCallback((e: ThreeEvent<PointerEvent>) => {
     e.stopPropagation();
-    if (selected || !wallMatRef.current) return;
-    wallMatRef.current.emissive.setHex(0xffb066);
-    wallMatRef.current.emissiveIntensity = 0.2;
+    if (selected) return;
+    const m = wallMeshRef.current;
+    if (!m) return;
+    if (m.material === SHARED_MATERIALS.wall) {
+      m.material = SHARED_HOVER_MATERIALS.wall;
+    } else {
+      const mat = m.material as THREE.MeshStandardMaterial;
+      if (mat && mat.emissive) {
+        mat.emissive.setHex(0xffb066);
+        mat.emissiveIntensity = 0.2;
+      }
+    }
     invalidate();
   }, [selected, invalidate]);
   const onWallOut = useCallback(() => {
-    if (selected || !wallMatRef.current) return;
-    wallMatRef.current.emissive.setHex(0x000000);
-    wallMatRef.current.emissiveIntensity = 0;
+    if (selected) return;
+    const m = wallMeshRef.current;
+    if (!m) return;
+    if (m.material === SHARED_HOVER_MATERIALS.wall) {
+      m.material = SHARED_MATERIALS.wall;
+    } else {
+      const mat = m.material as THREE.MeshStandardMaterial;
+      if (mat && mat.emissive) {
+        mat.emissive.setHex(0x000000);
+        mat.emissiveIntensity = 0;
+      }
+    }
     invalidate();
   }, [selected, invalidate]);
+
 
   return (
     <group position={[wall.p1.x, 0, wall.p1.y]} rotation={[0, -angle, 0]}>
       <mesh
+        ref={wallMeshRef}
         geometry={geom}
         onClick={isInteractive ? (e) => { e.stopPropagation(); onClick(e); } : undefined}
         onPointerOver={isInteractive ? onWallOver : undefined}
         onPointerOut={isInteractive ? onWallOut : undefined}
-        raycast={isInteractive ? undefined : () => null}
+        raycast={isInteractive ? DEFAULT_MESH_RAYCAST : NULL_RAYCAST}
         castShadow
         receiveShadow
       >
@@ -816,6 +859,7 @@ function WallMeshImpl({ wall, ceilingPx, inchToPx, doors, windows, color, materi
           <meshStandardMaterial ref={wallMatRef} color={tint ?? color} emissive={selEmissive} emissiveIntensity={selEmissiveIntensity} roughness={0.85} metalness={0.05} />
         )}
       </mesh>
+
 
       {/* ALL TRIMS & BASEBOARDS (Mapped natively using SweepPiece). Sweep
           pieces disable their own raycast, so hover on the group is driven
@@ -941,7 +985,7 @@ function OpeningPlaceholderImpl({ position, rotationY, width, height, thickness,
         onClick={isInteractive ? (e) => { e.stopPropagation(); onClick(e); } : undefined}
         onPointerOver={isInteractive ? onOver : undefined}
         onPointerOut={isInteractive ? onOut : undefined}
-        raycast={isInteractive ? undefined : () => null}
+        raycast={isInteractive ? DEFAULT_MESH_RAYCAST : NULL_RAYCAST}
       >
         <boxGeometry args={[width, height, thickness * 0.6]} />
         <meshStandardMaterial ref={matRef} color={color} transparent opacity={0.55} emissive={selEmissive} emissiveIntensity={selEmissiveIntensity} />
@@ -1144,17 +1188,18 @@ export default function FloorPlan3D({ floorsData, visibleFloor, furnitureAssets,
   const lightingInputs = useMemo(() => {
     const floors: Floor[] = [];
     const walls: Wall[] = [];
-    const windows: WindowItem[] = [];
+    const windowGroups: { windows: WindowItem[]; yOffsetPx: number }[] = [];
     let maxCeilingIn = 0;
-    for (const fd of floorsData) {
+    for (let i = 0; i < floorsData.length; i++) {
+      const fd = floorsData[i];
       floors.push(...fd.floors);
       walls.push(...fd.walls);
-      windows.push(...fd.windows);
+      windowGroups.push({ windows: fd.windows, yOffsetPx: stackY[i] ?? 0 });
       if (fd.ceilingHeightIn > maxCeilingIn) maxCeilingIn = fd.ceilingHeightIn;
     }
-    return { floors, walls, windows, ceilingPx: inchToPx(maxCeilingIn || 108) };
+    return { floors, walls, windowGroups, ceilingPx: inchToPx(maxCeilingIn || 108) };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [floorsData, pixelsPerFoot]);
+  }, [floorsData, pixelsPerFoot, stackY]);
 
   return (
     <Canvas
@@ -1186,7 +1231,7 @@ export default function FloorPlan3D({ floorsData, visibleFloor, furnitureAssets,
         <LightingSystem
           floors={lightingInputs.floors}
           walls={lightingInputs.walls}
-          windows={lightingInputs.windows}
+          windowGroups={lightingInputs.windowGroups}
           ceilingPx={lightingInputs.ceilingPx}
           pixelsPerFoot={pixelsPerFoot}
           sunIntensity={directionalIntensity}
