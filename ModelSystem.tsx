@@ -1,8 +1,9 @@
-import { memo, useEffect, useMemo, useRef, useState, Suspense } from "react";
+import { memo, useEffect, useMemo, useRef, Suspense } from "react";
 import { useGLTF, Line } from "@react-three/drei";
 import * as THREE from "three";
 import { SkeletonUtils } from "three-stdlib";
 import type { Door, WindowItem, Wall, Selection3D } from "./FloorPlan3D";
+import { applyGlassSwap, SHARED_GLASS_MATERIAL } from "@/lib/sharedMaterials";
 
 // ---------- helpers ----------
 
@@ -32,38 +33,8 @@ function findWallForOpening(center: { x: number; y: number }, walls: Wall[]) {
   return best?.wall ?? null;
 }
 
-// Mutate materials on the source scene so all clones share the treatment.
-// Glass materials become transparent; everything else is left at full opacity.
-function applyGlassMaterials(obj: THREE.Object3D) {
-  obj.traverse((c) => {
-    const mesh = c as THREE.Mesh;
-    if (!(mesh as THREE.Mesh).isMesh) return;
-    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-    let isGlass = false;
-    mats.forEach((mat) => {
-      if (!mat) return;
-      const name = (mat.name ?? "").toLowerCase();
-      const std = mat as THREE.MeshStandardMaterial;
-      if (name.includes("glass")) {
-        isGlass = true;
-        std.transparent = true;
-        std.opacity = 0.25;
-        std.roughness = 0.05;
-        std.metalness = 0.0;
-        std.depthWrite = false;
-        if ("transmission" in std) {
-          (std as unknown as { transmission: number }).transmission = 0.9;
-        }
-        std.needsUpdate = true;
-      }
-    });
-    mesh.castShadow = !isGlass;
-    mesh.receiveShadow = !isGlass;
-  });
-}
-
-// Native bounds + center of a GLTF scene. Used to position/scale instances
-// and to render the selection wireframe overlay.
+// Native bounds + center of a GLTF scene — used for placement/scale + the
+// selection wireframe overlay.
 function useNativeBox(scene: THREE.Object3D) {
   return useMemo(() => {
     const box = new THREE.Box3().setFromObject(scene);
@@ -83,8 +54,8 @@ function useNativeBox(scene: THREE.Object3D) {
 }
 
 // 12-edge wireframe points for a unit box scaled to the model's native size.
-// Rendered via drei's <Line> so we get real pixel thickness; cheap and shared
-// across renders since it only depends on the source scene.
+// Rendered only for the SELECTED state; hover no longer emits a wireframe so
+// we don't rebuild bounding-box data on every mouse move.
 function useEdgePoints(size: { x: number; y: number; z: number }) {
   return useMemo(() => {
     const box = new THREE.BoxGeometry(size.x, size.y, size.z);
@@ -100,35 +71,20 @@ function useEdgePoints(size: { x: number; y: number; z: number }) {
   }, [size.x, size.y, size.z]);
 }
 
-// Per-instance scene-graph clone WITHOUT cloning materials/geometries. This
-// is the leak-free version: each instance gets its own Object3D tree (so
-// per-door rotations don't bleed) while geometries and materials remain the
-// shared, cached references owned by useGLTF.
+// Per-instance scene-graph clone WITHOUT cloning geometries. Materials are
+// shared across instances (see useTintedMaterials for the tint path).
 function useInstanceClone(scene: THREE.Object3D) {
-  const clone = useMemo(() => SkeletonUtils.clone(scene), [scene]);
-  useEffect(() => {
-    return () => {
-      clone.traverse((c) => {
-        const m = c as THREE.Mesh;
-        if (!(m as THREE.Mesh).isMesh) return;
-        // Only dispose if this geometry/material is NOT the source's instance
-        // (i.e. something genuinely cloned for this tree).
-        // Materials/geometries from useGLTF are shared and must be left alone.
-      });
-    };
-  }, [clone]);
-  return clone;
+  return useMemo(() => SkeletonUtils.clone(scene), [scene]);
 }
 
-// Apply a tint to the cloned subtree by replacing each mesh's material with
-// a per-instance clone whose `color` is multiplied by the tint. Restores and
-// disposes when tint or root changes. Glass materials are left untouched so
-// their transparency/transmission isn't visually overridden.
+// Replace materials on the cloned subtree with per-instance clones tinted by
+// `tint`. Glass meshes keep the shared glass material — never clone the
+// shared shader. On unmount or tint change, restore originals + dispose any
+// per-instance clones so VRAM stays flat.
 function useTintedMaterials(root: THREE.Object3D, tint?: string) {
   const disposablesRef = useRef<THREE.Material[]>([]);
   const originalsRef = useRef<{ mesh: THREE.Mesh; mat: THREE.Material | THREE.Material[] }[]>([]);
   useEffect(() => {
-    // Restore previous originals and dispose previously cloned materials
     for (const { mesh, mat } of originalsRef.current) mesh.material = mat;
     originalsRef.current = [];
     for (const m of disposablesRef.current) m.dispose();
@@ -142,6 +98,9 @@ function useTintedMaterials(root: THREE.Object3D, tint?: string) {
       const mats = (isArr ? mesh.material : [mesh.material]) as THREE.Material[];
       const newMats = mats.map((mat) => {
         if (!mat) return mat;
+        // Never clone the shared glass shader — that would defeat the shared
+        // reference and re-introduce the VRAM leak.
+        if (mat === SHARED_GLASS_MATERIAL) return mat;
         const name = (mat.name ?? "").toLowerCase();
         if (name.includes("glass")) return mat;
         const cloned = (mat as THREE.MeshStandardMaterial).clone();
@@ -172,6 +131,7 @@ function DoorInstanceImpl({
   selected,
   onClick,
   tint,
+  isInteractive,
 }: {
   door: Door;
   url: string;
@@ -179,25 +139,24 @@ function DoorInstanceImpl({
   selected: boolean;
   onClick: () => void;
   tint?: string;
+  isInteractive: boolean;
 }) {
   const { scene } = useGLTF(url);
+  // Swap glass meshes to the module-level shared MeshPhysicalMaterial.
+  // Mutates the source scene once; all clones inherit the shared reference.
   useEffect(() => {
-    applyGlassMaterials(scene);
+    applyGlassSwap(scene);
   }, [scene]);
 
   const { size: baseSize } = useNativeBox(scene);
   const cloned = useInstanceClone(scene);
   useTintedMaterials(cloned, tint);
 
-  const [hovered, setHovered] = useState(false);
-
-  // Double-door swing animation: rotate Left_Door/Right_Door meshes if present.
-  // Falls back gracefully for single-door models lacking these named objects.
+  // Double-door swing animation
   useEffect(() => {
     const leftDoor = cloned.getObjectByName("Left_Door");
     const rightDoor = cloned.getObjectByName("Right_Door");
     if (!leftDoor || !rightDoor) return;
-
     const swingDir = door.flipY ? 1 : -1;
     const isOpen = door.open === true;
     const rotationAmount = isOpen ? (Math.PI / 2) : 0;
@@ -240,8 +199,8 @@ function DoorInstanceImpl({
   const scaleY = heightPx / baseSize.y;
   const scaleZ = scaleX;
 
-  // Highlight wireframe uses the source scene's native bbox so it stays
-  // aligned regardless of per-instance rotations on the cloned subtree.
+  // Selection wireframe only. Hover no longer builds bounding-box geometry —
+  // GLTF traversal on every mouse-move is too expensive.
   const highlightSize = useMemo(() => {
     const b = new THREE.Box3().setFromObject(scene);
     const s = new THREE.Vector3();
@@ -254,23 +213,23 @@ function DoorInstanceImpl({
     };
   }, [scene]);
   const edgePoints = useEdgePoints(highlightSize.size);
-  const highlight = selected ? "#ff7a18" : hovered ? "#ffc56b" : null;
 
   return (
     <group
       position={[hinge.x, 0, hinge.y]}
       rotation={[0, rotationY, 0]}
       scale={[scaleX, scaleY, scaleZ]}
-      onClick={(e) => { e.stopPropagation(); onClick(); }}
-      onPointerOver={(e) => { e.stopPropagation(); setHovered(true); }}
-      onPointerOut={(e) => { e.stopPropagation(); setHovered(false); }}
+      onClick={isInteractive ? (e) => { e.stopPropagation(); onClick(); } : undefined}
+      onPointerOver={isInteractive ? (e) => { e.stopPropagation(); document.body.style.cursor = "pointer"; } : undefined}
+      onPointerOut={isInteractive ? () => { document.body.style.cursor = ""; } : undefined}
+      raycast={isInteractive ? undefined : () => null}
     >
       <primitive object={cloned} />
-      {highlight && (
+      {selected && (
         <Line
           points={edgePoints}
           segments
-          color={highlight}
+          color="#ff7a18"
           lineWidth={4}
           position={[highlightSize.center.x, highlightSize.center.y, highlightSize.center.z]}
           toneMapped={false}
@@ -280,7 +239,7 @@ function DoorInstanceImpl({
   );
 }
 export const DoorInstance = memo(DoorInstanceImpl, (a, b) =>
-  a.door === b.door && a.url === b.url && a.selected === b.selected && a.tint === b.tint && a.inchToPx === b.inchToPx,
+  a.door === b.door && a.url === b.url && a.selected === b.selected && a.tint === b.tint && a.inchToPx === b.inchToPx && a.isInteractive === b.isInteractive,
 );
 
 // ---------- Window ----------
@@ -294,6 +253,7 @@ function WindowInstanceImpl({
   selected,
   onClick,
   tint,
+  isInteractive,
 }: {
   win: WindowItem;
   walls: Wall[];
@@ -303,10 +263,11 @@ function WindowInstanceImpl({
   selected: boolean;
   onClick: () => void;
   tint?: string;
+  isInteractive: boolean;
 }) {
   const { scene } = useGLTF(url);
   useEffect(() => {
-    applyGlassMaterials(scene);
+    applyGlassSwap(scene);
   }, [scene]);
 
   const { size: baseSize, center: baseCenter } = useNativeBox(scene);
@@ -317,8 +278,6 @@ function WindowInstanceImpl({
   const heightPxForTop = inchToPx(win.height_in ?? 48);
   const topY = sillPx + heightPxForTop;
   void ceilingPx;
-
-  const [hovered, setHovered] = useState(false);
 
   const wall = findWallForOpening(win.center, walls);
   const wallAngle = wall
@@ -333,10 +292,6 @@ function WindowInstanceImpl({
   const scaleZ = (wallThickness / baseSize.z) * 0.8;
 
   const edgePoints = useEdgePoints(baseSize);
-  const highlight = selected ? "#ff7a18" : hovered ? "#ffc56b" : null;
-  // Counter-scale the highlight in local Z so it pokes ~3" past each wall
-  // face instead of being buried inside the wall (model only occupies 80%
-  // of wall thickness, and the wireframe would otherwise scale with it).
   const padInPx = inchToPx(3);
   const desiredWorldZ = wallThickness + padInPx * 2;
   const highlightZMul = desiredWorldZ / Math.max(baseSize.z * scaleZ, 1e-3);
@@ -346,17 +301,18 @@ function WindowInstanceImpl({
       position={[win.center.x, topY, win.center.y]}
       rotation={[0, -wallAngle, 0]}
       scale={[scaleX, scaleY, scaleZ]}
-      onClick={(e) => { e.stopPropagation(); onClick(); }}
-      onPointerOver={(e) => { e.stopPropagation(); setHovered(true); }}
-      onPointerOut={(e) => { e.stopPropagation(); setHovered(false); }}
+      onClick={isInteractive ? (e) => { e.stopPropagation(); onClick(); } : undefined}
+      onPointerOver={isInteractive ? (e) => { e.stopPropagation(); document.body.style.cursor = "pointer"; } : undefined}
+      onPointerOut={isInteractive ? () => { document.body.style.cursor = ""; } : undefined}
+      raycast={isInteractive ? undefined : () => null}
     >
       <primitive object={cloned} />
-      {highlight && (
+      {selected && (
         <group scale={[1, 1, highlightZMul]} position={[0, 0, 0]}>
           <Line
             points={edgePoints}
             segments
-            color={highlight}
+            color="#ff7a18"
             lineWidth={4}
             position={[baseCenter.x, baseCenter.y, baseCenter.z / highlightZMul]}
             toneMapped={false}
@@ -368,7 +324,7 @@ function WindowInstanceImpl({
   );
 }
 export const WindowInstance = memo(WindowInstanceImpl, (a, b) =>
-  a.win === b.win && a.walls === b.walls && a.url === b.url && a.ceilingPx === b.ceilingPx && a.selected === b.selected && a.tint === b.tint && a.inchToPx === b.inchToPx,
+  a.win === b.win && a.walls === b.walls && a.url === b.url && a.ceilingPx === b.ceilingPx && a.selected === b.selected && a.tint === b.tint && a.inchToPx === b.inchToPx && a.isInteractive === b.isInteractive,
 );
 
 // Keep `Selection3D` re-exported for callers that import via this module.

@@ -2320,6 +2320,17 @@ export default function FloorPlanEditor() {
     visualMetadata,
   ]);
 
+  // Merge visualMetadata from BOTH floors so the inactive floor's tints,
+  // materials, and model assignments stay visible in 3D. IDs are floor-
+  // prefixed so there's no conflict; the active floor's live state takes
+  // precedence if any collision occurs.
+  const mergedVisualMetadata3D = useMemo(() => {
+    const inactive: 1 | 2 = activeFloor === 1 ? 2 : 1;
+    const other = floorSnapshotsRef.current[inactive]?.visualMetadata ?? {};
+    return { ...other, ...visualMetadata };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeFloor, visualMetadata, floorSnapshotTick]);
+
 
 
 
@@ -7317,7 +7328,7 @@ export default function FloorPlanEditor() {
               visibleFloor={visibleFloor}
               furnitureAssets={allAssets}
               pixelsPerFoot={pixelsPerFoot}
-              visualMetadata={visualMetadata}
+              visualMetadata={mergedVisualMetadata3D}
               selection={selection3D}
               onSelect={(s) => {
                 if (s) {

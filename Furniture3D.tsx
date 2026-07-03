@@ -1,38 +1,10 @@
-import { memo, useEffect, useMemo, useState, Suspense } from "react";
-import { useGLTF, Clone, Line } from "@react-three/drei";
+import { memo, useEffect, useMemo, useRef, Suspense } from "react";
+import { useGLTF, Line } from "@react-three/drei";
 import * as THREE from "three";
+import { SkeletonUtils } from "three-stdlib";
 import type { FurnitureItem, Selection3D } from "./FloorPlan3D";
 import type { AssetModel, AssetCategory } from "@/lib/assets";
-
-// Mark any material whose name contains "glass" (case-insensitive) as a
-// transparent, light-passing surface — mirrors the window/door treatment.
-function applyGlassMaterials(obj: THREE.Object3D) {
-  obj.traverse((c) => {
-    const mesh = c as THREE.Mesh;
-    if (!(mesh as THREE.Mesh).isMesh) return;
-    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-    let isGlass = false;
-    mats.forEach((mat) => {
-      if (!mat) return;
-      const name = (mat.name ?? "").toLowerCase();
-      const std = mat as THREE.MeshStandardMaterial;
-      if (name.includes("glass")) {
-        isGlass = true;
-        std.transparent = true;
-        std.opacity = 0.25;
-        std.roughness = 0.05;
-        std.metalness = 0.0;
-        std.depthWrite = false;
-        if ("transmission" in std) {
-          (std as unknown as { transmission: number }).transmission = 0.9;
-        }
-        std.needsUpdate = true;
-      }
-    });
-    mesh.castShadow = !isGlass;
-    mesh.receiveShadow = !isGlass;
-  });
-}
+import { applyGlassSwap, SHARED_GLASS_MATERIAL } from "@/lib/sharedMaterials";
 
 // 2D furniture type → asset category. Identity for the spec'd 19 types, plus
 // legacy aliases used by the current catalog (sink, single_counter, double_counter).
@@ -71,29 +43,80 @@ export function defaultFurnitureModelUrl(
   return (def ?? assets.find((a) => a.category === cat))?.model_url;
 }
 
+// Per-instance scene clone that reuses the source's cached geometries/materials.
+function useInstanceClone(scene: THREE.Object3D) {
+  return useMemo(() => SkeletonUtils.clone(scene), [scene]);
+}
+
+// Tint the cloned subtree by swapping in per-instance cloned materials whose
+// color is set to `tint`. Glass meshes (shared reference) are left untouched
+// so we don't multiply shader programs across instances.
+function useTintedMaterials(root: THREE.Object3D, tint?: string) {
+  const disposablesRef = useRef<THREE.Material[]>([]);
+  const originalsRef = useRef<{ mesh: THREE.Mesh; mat: THREE.Material | THREE.Material[] }[]>([]);
+  useEffect(() => {
+    for (const { mesh, mat } of originalsRef.current) mesh.material = mat;
+    originalsRef.current = [];
+    for (const m of disposablesRef.current) m.dispose();
+    disposablesRef.current = [];
+    if (!tint) return;
+    const color = new THREE.Color(tint);
+    root.traverse((c) => {
+      const mesh = c as THREE.Mesh;
+      if (!(mesh as THREE.Mesh).isMesh) return;
+      const isArr = Array.isArray(mesh.material);
+      const mats = (isArr ? mesh.material : [mesh.material]) as THREE.Material[];
+      const newMats = mats.map((mat) => {
+        if (!mat) return mat;
+        if (mat === SHARED_GLASS_MATERIAL) return mat;
+        const name = (mat.name ?? "").toLowerCase();
+        if (name.includes("glass")) return mat;
+        const cloned = (mat as THREE.MeshStandardMaterial).clone();
+        const std = cloned as THREE.MeshStandardMaterial;
+        if (std.color) std.color.copy(color);
+        std.needsUpdate = true;
+        disposablesRef.current.push(cloned);
+        return cloned;
+      });
+      originalsRef.current.push({ mesh, mat: mesh.material });
+      mesh.material = isArr ? newMats : newMats[0]!;
+    });
+    return () => {
+      for (const { mesh, mat } of originalsRef.current) mesh.material = mat;
+      originalsRef.current = [];
+      for (const m of disposablesRef.current) m.dispose();
+      disposablesRef.current = [];
+    };
+  }, [root, tint]);
+}
+
 const FurnitureInstance = memo(FurnitureInstanceImpl, (a, b) =>
-  a.item === b.item && a.url === b.url && a.selected === b.selected,
+  a.item === b.item && a.url === b.url && a.selected === b.selected &&
+  a.tint === b.tint && a.isInteractive === b.isInteractive,
 );
 function FurnitureInstanceImpl({
   item,
   url,
   selected,
   onClick,
+  tint,
+  isInteractive,
 }: {
   item: FurnitureItem;
   url: string;
   selected: boolean;
   onClick: () => void;
+  tint?: string;
+  isInteractive: boolean;
 }) {
   const { scene } = useGLTF(url);
-  // Apply glass transparency to any material named "glass" (matches windows).
   useEffect(() => {
-    applyGlassMaterials(scene);
+    applyGlassSwap(scene);
   }, [scene]);
 
-  // Native bounds — recomputed ONLY when the source GLTF scene changes, never
-  // on per-frame drag updates. Also captures the bbox center so the highlight
-  // wireframe sits over the model rather than sinking through the floor.
+  const cloned = useInstanceClone(scene);
+  useTintedMaterials(cloned, tint);
+
   const { nativeSize, nativeCenter } = useMemo(() => {
     const box = new THREE.Box3().setFromObject(scene);
     const s = new THREE.Vector3();
@@ -109,8 +132,6 @@ function FurnitureInstanceImpl({
       nativeCenter: { x: c.x, y: c.y, z: c.z },
     };
   }, [scene]);
-
-  const [hovered, setHovered] = useState(false);
 
   // Derive width/length/orientation from the 2D back_edge + corners.
   const placement = useMemo(() => {
@@ -142,23 +163,10 @@ function FurnitureInstanceImpl({
       if (d > lengthPx) lengthPx = d;
     }
     if (lengthPx < 1e-6) lengthPx = widthPx;
-    // Models face +Z by convention; our inward normal is (nx, ny), so add PI
-    // to flip the model so its front faces away from the back wall (into the room).
     const rotY = Math.atan2(-uy, ux) + Math.PI;
     return { ax, ay, rotY, widthPx, lengthPx };
   }, [item.back_edge, item.corners]);
 
-  if (!placement) return null;
-
-  const scaleX = placement.widthPx / nativeSize.x;
-  const scaleZ = placement.lengthPx / nativeSize.z;
-  const scaleY = (scaleX + scaleZ) / 2;
-
-  const highlight = selected ? "#ff7a18" : hovered ? "#ffc56b" : null;
-
-  // True wireframe edges (12 cube edges, no face diagonals). Extract endpoint
-  // pairs so drei's <Line> can render them with a real pixel thickness — plain
-  // <lineSegments> ignores linewidth on most platforms.
   const edgePoints = useMemo(() => {
     const box = new THREE.BoxGeometry(nativeSize.x, nativeSize.y, nativeSize.z);
     const edges = new THREE.EdgesGeometry(box);
@@ -172,30 +180,28 @@ function FurnitureInstanceImpl({
     return pts;
   }, [nativeSize.x, nativeSize.y, nativeSize.z]);
 
+  if (!placement) return null;
+
+  const scaleX = placement.widthPx / nativeSize.x;
+  const scaleZ = placement.lengthPx / nativeSize.z;
+  const scaleY = (scaleX + scaleZ) / 2;
+
   return (
     <group
       position={[placement.ax, 0, placement.ay]}
       rotation={[0, placement.rotY, 0]}
       scale={[scaleX, scaleY, scaleZ]}
-      onClick={(e) => {
-        e.stopPropagation();
-        onClick();
-      }}
-      onPointerOver={(e) => {
-        e.stopPropagation();
-        setHovered(true);
-      }}
-      onPointerOut={(e) => {
-        e.stopPropagation();
-        setHovered(false);
-      }}
+      onClick={isInteractive ? (e) => { e.stopPropagation(); onClick(); } : undefined}
+      onPointerOver={isInteractive ? (e) => { e.stopPropagation(); document.body.style.cursor = "pointer"; } : undefined}
+      onPointerOut={isInteractive ? () => { document.body.style.cursor = ""; } : undefined}
+      raycast={isInteractive ? undefined : () => null}
     >
-      <Clone object={scene} castShadow receiveShadow />
-      {highlight && (
+      <primitive object={cloned} />
+      {selected && (
         <Line
           points={edgePoints}
           segments
-          color={highlight}
+          color="#ff7a18"
           lineWidth={4}
           position={[nativeCenter.x, nativeCenter.y, nativeCenter.z]}
           toneMapped={false}
@@ -210,11 +216,13 @@ export function Furniture3D({
   assets,
   selection,
   onSelect,
+  isInteractive,
 }: {
   items: FurnitureItem[];
   assets: AssetModel[];
   selection: Selection3D;
   onSelect: (s: Selection3D) => void;
+  isInteractive: boolean;
 }) {
   return (
     <>
@@ -229,6 +237,7 @@ export function Furniture3D({
               url={url}
               selected={selected}
               onClick={() => onSelect({ kind: "furniture", id: f.id })}
+              isInteractive={isInteractive}
             />
           </Suspense>
         );
