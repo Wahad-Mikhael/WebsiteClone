@@ -38,6 +38,7 @@ import {
   RotateCw,
   ChevronRight,
   ChevronsUp,
+  ArrowLeftRight,
   Grip,
   type LucideIcon,
 } from "lucide-react";
@@ -153,6 +154,7 @@ type FurnitureItem = {
   back_edge?: { p1: Pt; p2: Pt };
   angle_deg: number;
   model_url?: string;
+  flipLR?: boolean;
 };
 type WindowItem = {
   id: string;
@@ -184,6 +186,8 @@ type StairsStructure = {
   linked_stair_id?: string;
   /** When set, this stair on Floor 1 projects a read-only hole onto Floor 2. */
   spans_to_floor?: 2;
+  /** Number of treads (steps) used by the procedural 3D staircase generator. */
+  tread_count?: number;
 };
 type RailingStructure = {
   id: string;
@@ -1604,9 +1608,10 @@ export default function FloorPlanEditor() {
     | { id: string; pointIndex: "p1" | "p2" | number; type: "wall" | "floor" | "railing" }
     | { id: string; type: "wall-body"; startSvg: Pt; origP1: Pt; origP2: Pt }
     | { id: string; type: "railing-body"; startSvg: Pt; origP1: Pt; origP2: Pt }
-    | { id: string; type: "stair-end"; axis: "x" | "y"; sign: -1 | 1; vertexIndices: number[]; clampAgainstIndices?: number[]; origPolygon: Pt[]; startSvg: Pt; rotation: number }
+    | { id: string; type: "stair-end"; axis: "x" | "y"; sign: -1 | 1; vertexIndices: number[]; clampAgainstIndices?: number[]; origPolygon: Pt[]; startSvg: Pt; rotation: number; origStart?: Pt; origEnd?: Pt }
     | { id: string; type: "stair-rotate"; cx: number; cy: number; startAngle: number; origRotationDeg: number }
-    | { id: string; type: "stair-body"; startSvg: Pt; origPolygon: Pt[]; origAnchor?: Pt }
+    | { id: string; type: "stair-body"; startSvg: Pt; origPolygon: Pt[]; origAnchor?: Pt; origStart?: Pt; origEnd?: Pt }
+
     | { id: string; type: "window" }
     | { id: string; type: "door" }
     | { id: string; type: "furniture-body"; startSvg: Pt; origCorners: Pt[]; origBackEdge?: { p1: Pt; p2: Pt } }
@@ -2299,6 +2304,7 @@ export default function FloorPlanEditor() {
         doors: snap.doors,
         windows: snap.windows,
         furniture: snap.furniture,
+        structures: snap.structures,
         ceilingHeightIn: snap.ceilingHeightIn ?? ceilingHeightIn,
       });
     }
@@ -3686,9 +3692,12 @@ export default function FloorPlanEditor() {
           if (drag.origAnchor) {
             next.rotation_anchor = { x: drag.origAnchor.x + dx, y: drag.origAnchor.y + dy };
           }
+          if (drag.origStart) next.start = { x: drag.origStart.x + dx, y: drag.origStart.y + dy };
+          if (drag.origEnd) next.end = { x: drag.origEnd.x + dx, y: drag.origEnd.y + dy };
           return next;
         }),
       );
+
       setSnapIndicator(null);
     } else if (activeDrag.type === "stair-rotate") {
       const drag = activeDrag;
@@ -3746,9 +3755,29 @@ export default function FloorPlanEditor() {
             if (!idxSet.has(i)) return { ...p };
             return drag.axis === "x" ? { x: p.x + d, y: p.y } : { x: p.x, y: p.y + d };
           });
-          return { ...s, polygon };
+          const next: StairsStructure = { ...s, polygon };
+          // Keep start/end anchored to their respective open-ends after resize.
+          if (drag.origStart || drag.origEnd) {
+            const stairWidthPx = inchesToPx(s.width_in ?? DEFAULT_STAIR_WIDTH_IN);
+            const newEnds = getStairOpenEnds(polygon, s.shape ?? "straight", stairWidthPx);
+            const origEnds = getStairOpenEnds(drag.origPolygon, s.shape ?? "straight", stairWidthPx);
+            const snap = (orig?: Pt): Pt | undefined => {
+              if (!orig || newEnds.length === 0 || origEnds.length === 0) return orig;
+              let bestI = 0, bestD = Infinity;
+              origEnds.forEach((e, i) => {
+                const dd = (e.mid.x - orig.x) ** 2 + (e.mid.y - orig.y) ** 2;
+                if (dd < bestD) { bestD = dd; bestI = i; }
+              });
+              const target = newEnds[Math.min(bestI, newEnds.length - 1)];
+              return { x: target.mid.x, y: target.mid.y };
+            };
+            if (drag.origStart) next.start = snap(drag.origStart);
+            if (drag.origEnd) next.end = snap(drag.origEnd);
+          }
+          return next;
         }),
       );
+
       setSnapIndicator(null);
     }
   };
@@ -3957,7 +3986,7 @@ export default function FloorPlanEditor() {
             stroke={stroke}
             strokeWidth={1}
           />
-          <g transform={`rotate(${safeAngle} ${safeAnchorX} ${safeAnchorY})`} style={{ pointerEvents: "none" }}>
+          <g transform={`rotate(${safeAngle} ${safeAnchorX} ${safeAnchorY})${f.flipLR ? ` translate(${2 * safeAnchorX} 0) scale(-1 1)` : ""}`} style={{ pointerEvents: "none" }}>
             {LengthComp ? (
               <LengthComp
                 anchorX={safeAnchorX}
@@ -4039,7 +4068,10 @@ export default function FloorPlanEditor() {
                     startSvg: sp,
                     origPolygon: s.polygon.map((p) => ({ ...p })),
                     origAnchor: s.rotation_anchor ? { ...s.rotation_anchor } : undefined,
+                    origStart: s.start ? { ...s.start } : undefined,
+                    origEnd: s.end ? { ...s.end } : undefined,
                   });
+
                 }}
                 style={{ cursor: drawMode ? undefined : "move" }}
               >
@@ -4113,6 +4145,69 @@ export default function FloorPlanEditor() {
                       </g>
                     );
                   });
+                })()}
+                {/* Start indicator — small arrow + label at the "Start" end of
+                    the run. Falls back to the first open-end midpoint when
+                    no explicit start_point is set on the stair. */}
+                {(() => {
+                  const stairWidthPx = inchesToPx(s.width_in ?? DEFAULT_STAIR_WIDTH_IN);
+                  const ends = getStairOpenEnds(s.polygon, s.shape ?? "straight", stairWidthPx);
+                  const start = s.start ?? ends[0]?.mid;
+                  if (!start) return null;
+                  // Arrow direction = along the FIRST run (from the start short-end
+                  // pointing inward into the polygon). For L/U this correctly
+                  // follows the first flight rather than cutting diagonally to
+                  // the far end. Fallback: start→end / start→centroid.
+                  let ux = 0, uy = 0;
+                  const startEnd = ends
+                    .map((e) => ({ e, d: Math.hypot(e.mid.x - start.x, e.mid.y - start.y) }))
+                    .sort((a, b) => a.d - b.d)[0]?.e;
+                  if (startEnd) {
+                    // Inward = opposite of the outward sign along the end's axis.
+                    if (startEnd.axis === "x") { ux = -startEnd.sign; uy = 0; }
+                    else { ux = 0; uy = -startEnd.sign; }
+                  } else {
+                    const cx = s.polygon.reduce((a, p) => a + p.x, 0) / s.polygon.length;
+                    const cy = s.polygon.reduce((a, p) => a + p.y, 0) / s.polygon.length;
+                    const tx = (s.end?.x ?? cx) - start.x;
+                    const ty = (s.end?.y ?? cy) - start.y;
+                    const tl = Math.hypot(tx, ty) || 1;
+                    ux = tx / tl; uy = ty / tl;
+                  }
+                  const arrowLen = Math.min(stairWidthPx * 0.55, 22);
+                  const arrowHead = arrowLen * 0.35;
+                  const px = -uy, py = ux;
+                  const tip = { x: start.x + ux * arrowLen, y: start.y + uy * arrowLen };
+                  const base = { x: start.x, y: start.y };
+                  const hL = { x: tip.x - ux * arrowHead + px * arrowHead * 0.6, y: tip.y - uy * arrowHead + py * arrowHead * 0.6 };
+                  const hR = { x: tip.x - ux * arrowHead - px * arrowHead * 0.6, y: tip.y - uy * arrowHead - py * arrowHead * 0.6 };
+                  const sw2 = 1.6 / viewport.zoom;
+                  const fontSize = 10 / viewport.zoom;
+                  const labelPos = { x: start.x - ux * arrowLen * 0.5, y: start.y - uy * arrowLen * 0.5 };
+
+                  return (
+                    <g pointerEvents="none">
+                      <line x1={base.x} y1={base.y} x2={tip.x} y2={tip.y} stroke="#0ea5e9" strokeWidth={sw2} strokeLinecap="round" />
+                      <polygon
+                        points={`${tip.x},${tip.y} ${hL.x},${hL.y} ${hR.x},${hR.y}`}
+                        fill="#0ea5e9"
+                      />
+                      <text
+                        x={labelPos.x}
+                        y={labelPos.y}
+                        fontSize={fontSize}
+                        fontWeight={700}
+                        fill="#0ea5e9"
+                        stroke="#ffffff"
+                        strokeWidth={2.5 / viewport.zoom}
+                        paintOrder="stroke"
+                        textAnchor="middle"
+                        dominantBaseline="middle"
+                      >
+                        START
+                      </text>
+                    </g>
+                  );
                 })()}
               </g>
             );
@@ -4927,7 +5022,10 @@ export default function FloorPlanEditor() {
                       origPolygon: selectedStairs.polygon.map((p) => ({ ...p })),
                       startSvg: sp,
                       rotation: rotationRad,
+                      origStart: selectedStairs.start ? { ...selectedStairs.start } : undefined,
+                      origEnd: selectedStairs.end ? { ...selectedStairs.end } : undefined,
                     });
+
                   }}
                 />
               ))}
@@ -5692,12 +5790,54 @@ export default function FloorPlanEditor() {
                         </SelectContent>
                       </Select>
                     </div>
+                    <div>
+                      <label className="text-xs text-muted-foreground mb-1.5 block">Treads (steps)</label>
+                      <Input
+                        type="number"
+                        min={2}
+                        max={30}
+                        value={selectedStairs.tread_count ?? 13}
+                        onChange={(e) => {
+                          const n = Math.max(2, Math.min(30, Math.floor(Number(e.target.value) || 0)));
+                          pushHistory();
+                          setStructures((prev) =>
+                            prev.map((st) =>
+                              st.id === selectedId && st.kind === "stairs"
+                                ? { ...st, tread_count: n }
+                                : st,
+                            ),
+                          );
+                        }}
+                        className="h-8 text-xs"
+                      />
+                    </div>
                     <div className="flex justify-between text-xs">
                       <span className="text-muted-foreground">Run length</span>
                       <span className="font-mono text-foreground">
                         {formatFtIn(pxToInches(longPx))}
                       </span>
                     </div>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      className="w-full gap-1.5"
+                      onClick={() => {
+                        pushHistory();
+                        setStructures((prev) =>
+                          prev.map((st) => {
+                            if (st.id !== selectedId || st.kind !== "stairs") return st;
+                            const stairWidthPx = inchesToPx(st.width_in ?? DEFAULT_STAIR_WIDTH_IN);
+                            const ends = getStairOpenEnds(st.polygon, st.shape ?? "straight", stairWidthPx);
+                            const curStart = st.start ?? ends[0]?.mid;
+                            const curEnd = st.end ?? ends[1]?.mid;
+                            if (!curStart || !curEnd) return st;
+                            return { ...st, start: { ...curEnd }, end: { ...curStart } };
+                          }),
+                        );
+                      }}
+                    >
+                      <ArrowLeftRight className="h-3.5 w-3.5" /> Switch Start/End
+                    </Button>
                     <Button
                       variant="destructive"
                       size="sm"
@@ -6193,6 +6333,21 @@ export default function FloorPlanEditor() {
                         </Select>
                       </div>
                     )}
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      className="w-full gap-1.5"
+                      onClick={() => {
+                        pushHistory();
+                        setFurniture((prev) =>
+                          prev.map((f) =>
+                            f.id === selectedFurniture.id ? { ...f, flipLR: !f.flipLR } : f,
+                          ),
+                        );
+                      }}
+                    >
+                      <FlipHorizontal className="h-3.5 w-3.5" /> Flip L/R
+                    </Button>
                     <Button
                       variant="destructive"
                       size="sm"

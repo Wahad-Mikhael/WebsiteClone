@@ -7,7 +7,8 @@ import LightingSystem from "./LightingSystem";
 import { DoorInstance, WindowInstance, useModelPreload } from "./ModelSystem";
 import { Furniture3D } from "./Furniture3D";
 import type { AssetModel } from "@/lib/assets";
-import { SHARED_MATERIALS, SHARED_HOVER_MATERIALS } from "@/lib/sharedMaterials";
+import { SHARED_MATERIALS, SHARED_HOVER_MATERIALS, SHARED_STAIR_STRINGER_MATERIAL } from "@/lib/sharedMaterials";
+import { getStairInitialRunAngle, getStairTurnSign, type StairLike } from "@/lib/stairLogic";
 
 export type Pt = { x: number; y: number };
 export type Floor = { id: string; polygon: Pt[] };
@@ -59,6 +60,7 @@ export type FurnitureItem = {
   back_edge?: { p1: Pt; p2: Pt };
   angle_deg: number;
   model_url?: string;
+  flipLR?: boolean;
 };
 export type Selection3D =
   | { kind: "wall"; id: string }
@@ -67,7 +69,25 @@ export type Selection3D =
   | { kind: "window"; id: string }
   | { kind: "baseboard"; id: string }
   | { kind: "furniture"; id: string }
+  | { kind: "stairs"; id: string }
   | null;
+
+export type StairsStructure3D = {
+  id: string;
+  kind: "stairs";
+  polygon: Pt[];
+  shape?: "straight" | "L" | "U";
+  width_in?: number;
+  rotation_rad?: number;
+  rotation_anchor?: Pt;
+  direction?: "UP" | "DN";
+  start?: Pt;
+  end?: Pt;
+  linked_stair_id?: string;
+  spans_to_floor?: 2;
+  tread_count?: number;
+};
+export type Structure3D = StairsStructure3D | { id: string; kind: "railing"; [k: string]: unknown };
 
 export interface FloorData {
   floors: Floor[];
@@ -75,6 +95,7 @@ export interface FloorData {
   doors: Door[];
   windows: WindowItem[];
   furniture?: FurnitureItem[];
+  structures?: Structure3D[];
   ceilingHeightIn: number;
 }
 
@@ -1026,12 +1047,366 @@ function CeilingMeshImpl({ polygon, yPx }: { polygon: Pt[]; yPx: number }) {
 }
 const CeilingMesh = memo(CeilingMeshImpl, (a, b) => a.polygon === b.polygon && a.yPx === b.yPx);
 
+// ============================================================================
+// StairMesh — procedural 3D staircase generator
+// ============================================================================
+//
+// Local coordinate system inside the outer <group>:
+//   +X  = along the initial run direction (forward)
+//   +Y  = up
+//   +Z  = across stair width (centered on 0)
+//
+// Shapes:
+//   straight → one flight of `tread_count` treads.
+//   L        → flight 1 (~half) + square landing + flight 2 rotated ±90°.
+//   U        → flight 1 (~half) + double-wide landing + flight 2 rotated 180°.
+
+
+type StairFlightPiece =
+  | { kind: "tread"; x: number; y: number; z: number; depth: number; width: number; thickness: number; rotY: number }
+  | { kind: "riser"; x: number; y: number; z: number; width: number; height: number; thickness: number; rotY: number }
+  | { kind: "landing"; x: number; y: number; z: number; sizeX: number; sizeZ: number; thickness: number }
+  | { kind: "stringer"; x: number; y: number; z: number; length: number; height: number; thickness: number; rotY: number; rotZ: number };
+
+interface StairFlightsResult {
+  pieces: StairFlightPiece[];
+}
+
+function computeRunLengthPx(stair: StairsStructure3D, widthPx: number): number {
+  // Perimeter-based measure: for straight = long side; for L/U = sum of leg run
+  // lengths (perimeter along the run axes, discounting landing widths).
+  const b = (() => {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const p of stair.polygon) {
+      if (p.x < minX) minX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.x > maxX) maxX = p.x;
+      if (p.y > maxY) maxY = p.y;
+    }
+    return { w: maxX - minX, h: maxY - minY };
+  })();
+  const shape = stair.shape ?? "straight";
+  if (shape === "straight") return Math.max(b.w, b.h);
+  if (shape === "L") {
+    // Two legs share a widthPx × widthPx corner landing.
+    return Math.max(0, b.w - widthPx) + Math.max(0, b.h - widthPx);
+  }
+  // U — two long legs + connecting landing (widthPx deep).
+  // Run length ≈ 2 × (long leg - widthPx)
+  const longLeg = Math.max(b.w, b.h);
+  return Math.max(0, 2 * (longLeg - widthPx));
+}
+
+function buildStairFlights(
+  stair: StairsStructure3D,
+  totalHeight: number,
+  widthPx: number,
+  treadThickness: number,
+  overhang: number,
+  stringerHeight: number,
+  stringerThickness: number,
+  turnSign: 1 | -1,
+): StairFlightsResult {
+  const shape = stair.shape ?? "straight";
+  const nTreads = Math.max(2, Math.floor(stair.tread_count ?? 13));
+  const riserHeight = totalHeight / nTreads;
+  const runLength = computeRunLengthPx(stair, widthPx);
+  const pieces: StairFlightPiece[] = [];
+
+  const riserThickness = Math.max(0.5, treadThickness * 0.5);
+
+  const addFlight = (
+    originX: number, originY: number, originZ: number,
+    rotY: number, treads: number, treadDepth: number,
+  ) => {
+    const cos = Math.cos(rotY);
+    const sin = Math.sin(rotY);
+    for (let i = 0; i < treads; i++) {
+      // Tread top surface at y = originY + (i+1)*riserHeight.
+      const treadCenterLocalX = i * treadDepth + treadDepth / 2;
+      const y = originY + (i + 1) * riserHeight - treadThickness / 2;
+      const tx = originX + treadCenterLocalX * cos;
+      const tz = originZ + treadCenterLocalX * sin;
+      pieces.push({
+        kind: "tread",
+        x: tx, y, z: tz,
+        depth: treadDepth + overhang,
+        width: widthPx,
+        thickness: treadThickness,
+        rotY,
+      });
+      // Riser i sits at the back edge of tread i, spanning from y=i*riserHeight
+      // to (i+1)*riserHeight − treadThickness (meeting underside of tread).
+      const riserLocalX = i * treadDepth - overhang / 2 - riserThickness / 2;
+      const riserHeightBox = Math.max(0.1, riserHeight - treadThickness);
+      const riserY = originY + i * riserHeight + riserHeightBox / 2;
+      const rx = originX + riserLocalX * cos;
+      const rz = originZ + riserLocalX * sin;
+      pieces.push({
+        kind: "riser",
+        x: rx, y: riserY, z: rz,
+        width: widthPx,
+        height: riserHeightBox,
+        thickness: riserThickness,
+        rotY,
+      });
+    }
+    // Two diagonal stringers along ±Z sides of this flight. Position is the
+    // exact midpoint of THIS flight; rotZ (pitch) is applied in the flight's
+    // local frame at render time via nested groups, so it works for any rotY.
+    const flightRun = treads * treadDepth;
+    const flightRise = treads * riserHeight;
+    const stringerLength = Math.hypot(flightRun, flightRise);
+    const pitch = Math.atan2(flightRise, flightRun);
+    const centerLocalX = flightRun / 2;
+    const centerY = originY + flightRise / 2;
+    for (const zSide of [-1, 1] as const) {
+      const localZ = zSide * (widthPx / 2 - stringerThickness / 2);
+      const wx = originX + centerLocalX * cos - localZ * sin;
+      const wz = originZ + centerLocalX * sin + localZ * cos;
+      pieces.push({
+        kind: "stringer",
+        x: wx,
+        y: centerY,
+        z: wz,
+        length: stringerLength,
+        height: stringerHeight,
+        thickness: stringerThickness,
+        rotY,
+        rotZ: pitch,
+      });
+    }
+    return { endX: originX + flightRun * cos, endZ: originZ + flightRun * sin, endY: originY + flightRise };
+  };
+
+  const addLanding = (x: number, y: number, z: number, sizeX: number, sizeZ: number) => {
+    pieces.push({
+      kind: "landing",
+      x, y: y - treadThickness / 2, z,
+      sizeX, sizeZ, thickness: treadThickness,
+    });
+  };
+
+  if (shape === "straight") {
+    const treadDepth = runLength / nTreads;
+    addFlight(0, 0, 0, 0, nTreads, treadDepth);
+  } else if (shape === "L") {
+    const f1 = Math.ceil(nTreads / 2);
+    const f2 = nTreads - f1;
+    const treadDepth = runLength / Math.max(1, f1 + f2);
+    const e1 = addFlight(0, 0, 0, 0, f1, treadDepth);
+    const landingCX = e1.endX + widthPx / 2;
+    // Landing is aligned with flight 1 on Z (same width, same axis), extending
+    // outward on X only. Its near edge on Z is the OUTER edge of flight 1,
+    // not the centerline.
+    const landingCZ = 0;
+    const landingY = e1.endY;
+    addLanding(landingCX, landingY, landingCZ, widthPx, widthPx);
+    // Flight 2 starts at the center of the landing on X and at the far Z edge
+    // of the landing (turn side), rotated ±90° per turnSign.
+    const f2StartX = landingCX;
+    const f2StartZ = turnSign * (widthPx / 2);
+    const f2RotY = turnSign * (Math.PI / 2);
+    addFlight(f2StartX, landingY, f2StartZ, f2RotY, f2, treadDepth);
+  } else {
+    const f1 = Math.ceil(nTreads / 2);
+    const f2 = nTreads - f1;
+    const treadDepth = runLength / Math.max(1, f1 + f2);
+    const e1 = addFlight(0, 0, 0, 0, f1, treadDepth);
+    const landingCX = e1.endX + widthPx / 2;
+    const landingCZ = turnSign * (widthPx / 2);
+    const landingY = e1.endY;
+    addLanding(landingCX, landingY, landingCZ, widthPx, 2 * widthPx);
+    // Flight 2 is rotated 180°, so building steps forward in its local +X
+    // draws them back toward the origin in parent space. Its origin sits at
+    // the same X axis where flight 1 ended, offset in Z by widthPx (parallel
+    // return flight on the turn side of the landing).
+    const f2StartX = e1.endX;
+    const f2StartZ = turnSign * widthPx;
+    addFlight(f2StartX, landingY, f2StartZ, Math.PI, f2, treadDepth);
+
+  }
+
+  return { pieces };
+}
+
+type StairMeshProps = {
+  stair: StairsStructure3D;
+  ceilingPx: number;
+  floorYOffset: number;
+  inchToPx: (n: number) => number;
+  selected: boolean;
+  onClick: () => void;
+  isInteractive: boolean;
+  tint?: string;
+};
+
+function StairMeshImpl({
+  stair, ceilingPx, floorYOffset, inchToPx, selected, onClick, isInteractive, tint,
+}: StairMeshProps) {
+  const matRef = useRef<THREE.MeshStandardMaterial | null>(null);
+
+  const start = stair.start ?? stair.polygon[0] ?? { x: 0, y: 0 };
+  const runAngle = useMemo(
+    () => getStairInitialRunAngle(stair as StairLike),
+    // Only re-compute when the inputs to the angle actually change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [stair.start?.x, stair.start?.y, stair.end?.x, stair.end?.y, stair.polygon],
+  );
+
+  const flights = useMemo(() => {
+    const widthPx = inchToPx(stair.width_in ?? 36);
+    // Floor thickness in the scene is ~0.5 px (see FloorMesh yOffset). We add
+    // it so the top tread lands flush with the upper-floor surface.
+    const totalHeight = ceilingPx + 0.5;
+    const treadThickness = inchToPx(1.75);
+    const overhang = inchToPx(1);
+    const stringerHeight = inchToPx(10);
+    const stringerThickness = inchToPx(1.5);
+    const turnSign = getStairTurnSign(stair as StairLike);
+    return buildStairFlights(
+      stair, totalHeight, widthPx,
+      treadThickness, overhang, stringerHeight, stringerThickness,
+      turnSign,
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    stair.id, stair.shape, stair.tread_count, stair.width_in,
+    stair.polygon, stair.start?.x, stair.start?.y, stair.end?.x, stair.end?.y,
+    ceilingPx, inchToPx,
+  ]);
+
+  // Selection glow — mutate shared/instance material without re-rendering.
+  useEffect(() => {
+    const m = matRef.current;
+    if (!m || !m.emissive) return;
+    if (selected) {
+      m.emissive.setHex(0xff7a18);
+      m.emissiveIntensity = 0.25;
+    } else {
+      m.emissive.setHex(0x000000);
+      m.emissiveIntensity = 0;
+    }
+    m.needsUpdate = true;
+  }, [selected]);
+
+  const color = tint ?? "#c9b89c";
+  
+
+  const rotRad = stair.rotation_rad ?? 0;
+  const anchor = stair.rotation_anchor ?? start;
+
+  return (
+    <group position={[anchor.x, floorYOffset, anchor.y]} rotation={[0, -rotRad, 0]}>
+    <group position={[start.x - anchor.x, 0, start.y - anchor.y]} rotation={[0, -runAngle, 0]}>
+      {flights.pieces.map((p, i) => {
+        if (p.kind === "tread") {
+          return (
+            <mesh
+              key={i}
+              position={[p.x, p.y, p.z]}
+              rotation={[0, p.rotY, 0]}
+              castShadow
+              receiveShadow
+              raycast={isInteractive ? DEFAULT_MESH_RAYCAST : NULL_RAYCAST}
+              onClick={isInteractive ? (e) => { e.stopPropagation(); onClick(); } : undefined}
+            >
+              <boxGeometry args={[p.depth, p.thickness, p.width]} />
+              {i === 0 ? (
+                <meshStandardMaterial ref={matRef} color={color} roughness={0.6} metalness={0.05} />
+              ) : (
+                <meshStandardMaterial color={color} roughness={0.6} metalness={0.05} />
+              )}
+            </mesh>
+          );
+        }
+        if (p.kind === "landing") {
+          return (
+            <mesh
+              key={i}
+              position={[p.x, p.y, p.z]}
+              castShadow
+              receiveShadow
+              raycast={isInteractive ? DEFAULT_MESH_RAYCAST : NULL_RAYCAST}
+              onClick={isInteractive ? (e) => { e.stopPropagation(); onClick(); } : undefined}
+            >
+              <boxGeometry args={[p.sizeX, p.thickness, p.sizeZ]} />
+              <meshStandardMaterial color={color} roughness={0.6} metalness={0.05} />
+            </mesh>
+          );
+        }
+        if (p.kind === "riser") {
+          return (
+            <mesh
+              key={i}
+              position={[p.x, p.y, p.z]}
+              rotation={[0, p.rotY, 0]}
+              castShadow
+              receiveShadow
+              raycast={isInteractive ? DEFAULT_MESH_RAYCAST : NULL_RAYCAST}
+              onClick={isInteractive ? (e) => { e.stopPropagation(); onClick(); } : undefined}
+            >
+              <boxGeometry args={[p.thickness, p.height, p.width]} />
+              <meshStandardMaterial color={color} roughness={0.7} metalness={0.05} />
+            </mesh>
+          );
+        }
+        // stringer — nest rotations so the pitch (rotZ) is applied in the
+        // flight's local frame *after* the Y rotation. Applying both on a
+        // single Euler `[0, rotY, rotZ]` uses XYZ order, which for flight 2
+        // of L/U shapes (rotY = ±π/2 or π) pitches the box in the wrong frame
+        // and lifts its midpoint toward the ceiling.
+        return (
+          <group key={i} position={[p.x, p.y, p.z]} rotation={[0, -p.rotY, 0]}>
+            <group rotation={[0, 0, p.rotZ]}>
+              <mesh
+                castShadow
+                receiveShadow
+                raycast={isInteractive ? DEFAULT_MESH_RAYCAST : NULL_RAYCAST}
+              >
+                <boxGeometry args={[p.length, p.height, p.thickness]} />
+                <primitive object={SHARED_STAIR_STRINGER_MATERIAL} attach="material" />
+              </mesh>
+            </group>
+          </group>
+        );
+      })}
+    </group>
+    </group>
+  );
+}
+const StairMesh = memo(StairMeshImpl, (a, b) => {
+  if (a.selected !== b.selected) return false;
+  if (a.isInteractive !== b.isInteractive) return false;
+  if (a.ceilingPx !== b.ceilingPx) return false;
+  if (a.floorYOffset !== b.floorYOffset) return false;
+  if (a.tint !== b.tint) return false;
+  if (a.inchToPx !== b.inchToPx) return false;
+  const s1 = a.stair, s2 = b.stair;
+  if (s1 === s2) return true;
+  if (s1.id !== s2.id) return false;
+  if (s1.shape !== s2.shape) return false;
+  if (s1.width_in !== s2.width_in) return false;
+  if (s1.tread_count !== s2.tread_count) return false;
+  if (s1.rotation_rad !== s2.rotation_rad) return false;
+  if ((s1.rotation_anchor?.x ?? 0) !== (s2.rotation_anchor?.x ?? 0)) return false;
+  if ((s1.rotation_anchor?.y ?? 0) !== (s2.rotation_anchor?.y ?? 0)) return false;
+  if ((s1.start?.x ?? 0) !== (s2.start?.x ?? 0)) return false;
+  if ((s1.start?.y ?? 0) !== (s2.start?.y ?? 0)) return false;
+  if ((s1.end?.x ?? 0) !== (s2.end?.x ?? 0)) return false;
+  if ((s1.end?.y ?? 0) !== (s2.end?.y ?? 0)) return false;
+  if (s1.polygon !== s2.polygon) return false;
+  return true;
+});
+
+
 type SceneContentsProps = {
   floors: Floor[];
   walls: Wall[];
   doors: Door[];
   windows: WindowItem[];
   furniture?: FurnitureItem[];
+  structures?: Structure3D[];
   furnitureAssets?: AssetModel[];
   ceilingHeightIn: number;
   pixelsPerFoot: number;
@@ -1040,7 +1415,7 @@ type SceneContentsProps = {
   onSelect: (s: Selection3D) => void;
   isInteractive: boolean;
 };
-function SceneContents({ floors, walls, doors, windows, furniture, furnitureAssets, ceilingHeightIn, pixelsPerFoot, visualMetadata, selection, onSelect, isInteractive }: SceneContentsProps) {
+function SceneContents({ floors, walls, doors, windows, furniture, structures, furnitureAssets, ceilingHeightIn, pixelsPerFoot, visualMetadata, selection, onSelect, isInteractive }: SceneContentsProps) {
   // Stable inchToPx across renders so memoized children don't invalidate.
   const inchToPx = useCallback((n: number) => (n / 12) * pixelsPerFoot, [pixelsPerFoot]);
   const ceilingPx = inchToPx(ceilingHeightIn);
@@ -1125,6 +1500,23 @@ function SceneContents({ floors, walls, doors, windows, furniture, furnitureAsse
           isInteractive={isInteractive}
         />
       )}
+      {structures && structures.map((s) => {
+        if (s.kind !== "stairs") return null;
+        const stair = s as StairsStructure3D;
+        return (
+          <StairMesh
+            key={stair.id}
+            stair={stair}
+            ceilingPx={ceilingPx}
+            floorYOffset={0}
+            inchToPx={inchToPx}
+            selected={selection?.kind === "stairs" && selection.id === stair.id}
+            onClick={() => onSelect({ kind: "stairs", id: stair.id })}
+            isInteractive={isInteractive}
+            tint={visualMetadata[stair.id]?.tint}
+          />
+        );
+      })}
     </Bvh>
   );
 }
@@ -1283,6 +1675,7 @@ export default function FloorPlan3D({ floorsData, visibleFloor, furnitureAssets,
                   doors={fd.doors}
                   windows={fd.windows}
                   furniture={fd.furniture}
+                  structures={fd.structures}
                   furnitureAssets={furnitureAssets}
                   ceilingHeightIn={fd.ceilingHeightIn}
                   pixelsPerFoot={pixelsPerFoot}

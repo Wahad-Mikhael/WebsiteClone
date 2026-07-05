@@ -8,7 +8,7 @@ import type { AssetModel, AssetCategory } from "@/lib/assets";
 import { applyGlassSwap, SHARED_GLASS_MATERIAL } from "@/lib/sharedMaterials";
 
 // 2D furniture type → asset category. Identity for the spec'd 19 types, plus
-// legacy aliases used by the current catalog (sink, single_counter, double_counter).
+// legacy aliases used by the current catalog (sink).
 export const FURNITURE_TYPE_TO_CATEGORY: Record<string, AssetCategory> = {
   king_bed: "king_bed",
   queen_bed: "queen_bed",
@@ -28,9 +28,9 @@ export const FURNITURE_TYPE_TO_CATEGORY: Record<string, AssetCategory> = {
   stove: "stove",
   fridge: "fridge",
   single_cabinet: "single_cabinet",
-  single_counter: "single_cabinet",
   double_cabinet: "double_cabinet",
-  double_counter: "double_cabinet",
+  single_counter: "single_counter",
+  double_counter: "double_counter",
   kitchen_island: "kitchen_island",
 };
 
@@ -44,14 +44,35 @@ export function defaultFurnitureModelUrl(
   return (def ?? assets.find((a) => a.category === cat))?.model_url;
 }
 
-// Per-instance scene clone that reuses the source's cached geometries/materials.
+// Per-instance scene clone that reuses cached geometries, with a per-instance
+// glass material clone to avoid shader cache mismatches across model types.
+// Per-instance scene clone that reuses cached geometries, with a per-instance
+// glass material clone to avoid shader cache mismatches across model types.
+// Also sets every mesh material to DoubleSide so a `scale.x = -1` flip
+// (which inverts winding) still renders correctly without cloning materials
+// on every flip toggle.
 function useInstanceClone(scene: THREE.Object3D) {
-  return useMemo(() => SkeletonUtils.clone(scene), [scene]);
+  return useMemo(() => {
+    const cloned = SkeletonUtils.clone(scene);
+    const glassMaterial = SHARED_GLASS_MATERIAL.clone();
+    glassMaterial.needsUpdate = true;
+    applyGlassSwap(cloned, glassMaterial);
+    cloned.traverse((c) => {
+      const mesh = c as THREE.Mesh;
+      if (!(mesh as THREE.Mesh).isMesh) return;
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      for (const m of mats) {
+        if (m && (m as THREE.Material).side !== THREE.DoubleSide) {
+          (m as THREE.Material).side = THREE.DoubleSide;
+        }
+      }
+    });
+    return { cloned, glassMaterial };
+  }, [scene]);
 }
 
 // Tint the cloned subtree by swapping in per-instance cloned materials whose
-// color is set to `tint`. Glass meshes (shared reference) are left untouched
-// so we don't multiply shader programs across instances.
+// color is set to `tint`. Glass meshes keep their per-instance glass material.
 function useTintedMaterials(root: THREE.Object3D, tint?: string) {
   const disposablesRef = useRef<THREE.Material[]>([]);
   const originalsRef = useRef<{ mesh: THREE.Mesh; mat: THREE.Material | THREE.Material[] }[]>([]);
@@ -93,7 +114,8 @@ function useTintedMaterials(root: THREE.Object3D, tint?: string) {
 
 const FurnitureInstance = memo(FurnitureInstanceImpl, (a, b) =>
   a.item === b.item && a.url === b.url && a.selected === b.selected &&
-  a.tint === b.tint && a.isInteractive === b.isInteractive,
+  a.tint === b.tint && a.isInteractive === b.isInteractive &&
+  a.item.flipLR === b.item.flipLR,
 );
 function FurnitureInstanceImpl({
   item,
@@ -111,23 +133,14 @@ function FurnitureInstanceImpl({
   isInteractive: boolean;
 }) {
   const { scene } = useGLTF(url);
-  useEffect(() => {
-    applyGlassSwap(scene);
-  }, [scene]);
 
-  const cloned = useInstanceClone(scene);
+  const { cloned, glassMaterial } = useInstanceClone(scene);
   useTintedMaterials(cloned, tint);
+  useEffect(() => () => {
+    glassMaterial.dispose();
+  }, [glassMaterial]);
   const bboxRef = useRef<THREE.Object3D>(null);
   const invalidate = useThree((s) => s.invalidate);
-
-  // Force the shared glass material's shader to recompile for the transparency
-  // pass whenever a new model is mounted. Runs strictly AFTER the new meshes
-  // are attached to the WebGL scene graph, so the renderer picks up transparency
-  // sorting on the first frame instead of rendering opaque.
-  useEffect(() => {
-    SHARED_GLASS_MATERIAL.needsUpdate = true;
-    invalidate();
-  }, [url, invalidate]);
 
   const { nativeSize, nativeCenter } = useMemo(() => {
     const box = new THREE.Box3().setFromObject(scene);
@@ -217,7 +230,9 @@ function FurnitureInstanceImpl({
       } : undefined}
       raycast={isInteractive ? undefined : () => null}
     >
-      <primitive object={cloned} />
+      <group scale={[item.flipLR ? -1 : 1, 1, 1]}>
+        <primitive object={cloned} />
+      </group>
       <Line
         ref={bboxRef as never}
         visible={false}

@@ -72,16 +72,22 @@ function useEdgePoints(size: { x: number; y: number; z: number }) {
   }, [size.x, size.y, size.z]);
 }
 
-// Per-instance scene-graph clone WITHOUT cloning geometries. Materials are
-// shared across instances (see useTintedMaterials for the tint path).
+// Per-instance scene-graph clone WITHOUT cloning geometries. Glass gets a
+// per-instance material clone so Three.js compiles against each model's
+// attribute signature instead of reusing one global shader program.
 function useInstanceClone(scene: THREE.Object3D) {
-  return useMemo(() => SkeletonUtils.clone(scene), [scene]);
+  return useMemo(() => {
+    const cloned = SkeletonUtils.clone(scene);
+    const glassMaterial = SHARED_GLASS_MATERIAL.clone();
+    glassMaterial.needsUpdate = true;
+    applyGlassSwap(cloned, glassMaterial);
+    return { cloned, glassMaterial };
+  }, [scene]);
 }
 
 // Replace materials on the cloned subtree with per-instance clones tinted by
-// `tint`. Glass meshes keep the shared glass material — never clone the
-// shared shader. On unmount or tint change, restore originals + dispose any
-// per-instance clones so VRAM stays flat.
+// `tint`. Glass meshes keep their per-instance glass material. On unmount or
+// tint change, restore originals + dispose any per-instance tint clones.
 function useTintedMaterials(root: THREE.Object3D, tint?: string) {
   const disposablesRef = useRef<THREE.Material[]>([]);
   const originalsRef = useRef<{ mesh: THREE.Mesh; mat: THREE.Material | THREE.Material[] }[]>([]);
@@ -99,8 +105,8 @@ function useTintedMaterials(root: THREE.Object3D, tint?: string) {
       const mats = (isArr ? mesh.material : [mesh.material]) as THREE.Material[];
       const newMats = mats.map((mat) => {
         if (!mat) return mat;
-        // Never clone the shared glass shader — that would defeat the shared
-        // reference and re-introduce the VRAM leak.
+        // Never tint/clone glass — it already has a per-instance glass
+        // material that must remain stable for this model instance.
         if (mat === SHARED_GLASS_MATERIAL) return mat;
         const name = (mat.name ?? "").toLowerCase();
         if (name.includes("glass")) return mat;
@@ -143,15 +149,13 @@ function DoorInstanceImpl({
   isInteractive: boolean;
 }) {
   const { scene } = useGLTF(url);
-  // Swap glass meshes to the module-level shared MeshPhysicalMaterial.
-  // Mutates the source scene once; all clones inherit the shared reference.
-  useEffect(() => {
-    applyGlassSwap(scene);
-  }, [scene]);
 
   const { size: baseSize } = useNativeBox(scene);
-  const cloned = useInstanceClone(scene);
+  const { cloned, glassMaterial } = useInstanceClone(scene);
   useTintedMaterials(cloned, tint);
+  useEffect(() => () => {
+    glassMaterial.dispose();
+  }, [glassMaterial]);
 
   // Double-door swing animation
   useEffect(() => {
@@ -216,13 +220,6 @@ function DoorInstanceImpl({
   const edgePoints = useEdgePoints(highlightSize.size);
   const bboxRef = useRef<THREE.Object3D>(null);
   const invalidate = useThree((s) => s.invalidate);
-
-  // Recompile shared glass material shader after new door meshes mount,
-  // so transparency sorting engages on frame 1 for dynamically added models.
-  useEffect(() => {
-    SHARED_GLASS_MATERIAL.needsUpdate = true;
-    invalidate();
-  }, [url, invalidate]);
 
   return (
     <group
@@ -298,13 +295,13 @@ function WindowInstanceImpl({
   isInteractive: boolean;
 }) {
   const { scene } = useGLTF(url);
-  useEffect(() => {
-    applyGlassSwap(scene);
-  }, [scene]);
 
   const { size: baseSize, center: baseCenter } = useNativeBox(scene);
-  const cloned = useInstanceClone(scene);
+  const { cloned, glassMaterial } = useInstanceClone(scene);
   useTintedMaterials(cloned, tint);
+  useEffect(() => () => {
+    glassMaterial.dispose();
+  }, [glassMaterial]);
 
   const sillPx = inchToPx(win.sill_height_in ?? 36);
   const heightPxForTop = inchToPx(win.height_in ?? 48);
@@ -329,13 +326,6 @@ function WindowInstanceImpl({
   const highlightZMul = desiredWorldZ / Math.max(baseSize.z * scaleZ, 1e-3);
   const bboxRef = useRef<THREE.Object3D>(null);
   const invalidate = useThree((s) => s.invalidate);
-
-  // Recompile shared glass material shader after new window meshes mount,
-  // so transparency sorting engages on frame 1 for dynamically added models.
-  useEffect(() => {
-    SHARED_GLASS_MATERIAL.needsUpdate = true;
-    invalidate();
-  }, [url, invalidate]);
 
   return (
     <group
