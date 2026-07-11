@@ -40,10 +40,13 @@ import {
   ChevronsUp,
   ArrowLeftRight,
   Grip,
+  Orbit,
+  Map as MapIcon,
+  SunMedium,
   type LucideIcon,
 } from "lucide-react";
 
-import { Custom_Rotate, Custom_Window, Custom_SlidingDoor, Custom_Polygon, Custom_Toilet, Custom_King_Bed, Custom_Queen_Bed, Custom_Double_Bed, Custom_Single_Bed, Custom_Bathtub, Custom_Small_Shower, Custom_Large_Shower, Custom_Stove, Custom_Fridge, Custom_Single_Sink, Custom_Single_Vanity, Custom_Double_Vanity, Custom_Single_Couch, Custom_Double_Couch, Custom_Triple_Couch, Custom_Single_Cabinet, Custom_Double_Cabinet, Custom_Kitchen_Island } from "./CustomIcons";
+import { Custom_Rotate, Custom_Window, Custom_SlidingDoor, Custom_Polygon, Custom_Toilet, Custom_King_Bed, Custom_Queen_Bed, Custom_Double_Bed, Custom_Single_Bed, Custom_Bathtub, Custom_Small_Shower, Custom_Large_Shower, Custom_Stove, Custom_Fridge, Custom_Single_Sink, Custom_Single_Vanity, Custom_Double_Vanity, Custom_Single_Couch, Custom_Double_Couch, Custom_Triple_Couch, Custom_Single_Counter, Custom_Double_Counter, Custom_Kitchen_Island } from "./CustomIcons";
 
 const ArchIcon = ({ className }: { className?: string }) => (
   <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth={1.75} strokeLinecap="round" strokeLinejoin="round">
@@ -57,6 +60,7 @@ import { Slider } from "@/components/ui/slider";
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
+import { Accordion, AccordionItem, AccordionTrigger, AccordionContent } from "@/components/ui/accordion";
 import {
   Select,
   SelectContent,
@@ -468,14 +472,13 @@ const snapFurnitureDimensions = <
     targetWidthIn = 36;
     targetLengthIn = currentLengthIn * ratio;
     newType = "fridge";
-  } else if (t === "counter" || t === "single_counter" || t === "double_counter") {
+  } else if (["counter", "single_counter", "double_counter", "cabinet", "single_cabinet", "double_cabinet"].includes(t)) {
     const c = pickByWidth([
-      { w: 36, type: "single_counter" },
-      { w: 42, type: "double_counter" },
+      { w: 30, l: 24, type: "single_counter" },
+      { w: 60, l: 24, type: "double_counter" },
     ]);
-    const ratio = c.w / currentWidthIn;
     targetWidthIn = c.w;
-    targetLengthIn = currentLengthIn * ratio;
+    targetLengthIn = c.l;
     newType = c.type;
   } else {
     return f;
@@ -851,7 +854,19 @@ const getStairOpenEnds = (
 ): StairOpenEnd[] => {
   if (shape === "straight" && poly.length === 4) {
     const { x, y, w, h } = polygonBbox(poly);
-    if (w >= h) {
+    // Prefer widthPx to decide which axis is the flight run: open ends are the
+    // two edges perpendicular to the run, so the SIDES (stringers) have length
+    // ≈ widthPx. Using w>=h alone breaks when a user shrinks the run below the
+    // stair width — the arrow/handles would flip to the wrong edges.
+    let runAlongX: boolean;
+    if (widthPx && widthPx > 0) {
+      // Which dimension is closer to the stair width? That dimension is the
+      // stringer span; the other is the run.
+      runAlongX = Math.abs(h - widthPx) <= Math.abs(w - widthPx);
+    } else {
+      runAlongX = w >= h;
+    }
+    if (runAlongX) {
       return [
         { mid: { x, y: y + h / 2 }, axis: "x", sign: -1, vertexIndices: [0, 3], cursor: "ew-resize" },
         { mid: { x: x + w, y: y + h / 2 }, axis: "x", sign: 1, vertexIndices: [1, 2], cursor: "ew-resize" },
@@ -1269,7 +1284,7 @@ const FURNITURE_CATALOG: { category: string; items: FurnitureCatalogItem[] }[] =
     category: "Kitchen",
     items: [
       { key: "stove",          label: "Stove",          type: "stove",          widthIn: 30, lengthIn: 25 },
-      { key: "fridge",         label: "Fridge",         type: "fridge",         widthIn: 30, lengthIn: 33 },
+      { key: "fridge",         label: "Fridge",         type: "fridge",         widthIn: 36, lengthIn: 33 },
       { key: "single_counter", label: "Single Counter", type: "single_counter", widthIn: 30, lengthIn: 24 },
       { key: "double_counter", label: "Double Counter", type: "double_counter", widthIn: 60, lengthIn: 24 },
       { key: "kitchen_island", label: "Kitchen Island", type: "kitchen_island", widthIn: 60, lengthIn: 36 },
@@ -1350,6 +1365,45 @@ function UploadDropZone({
   );
 }
 
+function DefaultsBlock({
+  value,
+  onChange,
+  title,
+}: {
+  value: UploadDefaults;
+  onChange: (v: UploadDefaults) => void;
+  title?: string;
+}) {
+  return (
+    <div className="flex-1 space-y-2">
+      {title && <p className="text-xs font-semibold text-muted-foreground">{title}</p>}
+      <div className="space-y-1">
+        <label className="text-[11px] text-muted-foreground">Default Ceiling Height</label>
+        <FtInStepper
+          totalIn={value.ceilingHeightIn}
+          onChange={(v) => onChange({ ...value, ceilingHeightIn: v })}
+          min={1}
+        />
+      </div>
+      <div className="space-y-1">
+        <label className="text-[11px] text-muted-foreground">Default Door Height</label>
+        <Select
+          value={String(value.defaultDoorHeightIn)}
+          onValueChange={(v) => onChange({ ...value, defaultDoorHeightIn: Number(v) })}
+        >
+          <SelectTrigger className="h-8 text-xs w-full [&>span]:flex-1 [&>span]:text-center">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={"80"} className="text-xs">6'-8"</SelectItem>
+            <SelectItem value={"96"} className="text-xs">8'-0"</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+    </div>
+  );
+}
+
 function UploadPlansDialog({
   open,
   onOpenChange,
@@ -1387,42 +1441,6 @@ function UploadPlansDialog({
 
   const canConfirm = count === 1 ? !!file1 : !!file1 && !!file2;
 
-  const DefaultsBlock = ({
-    value,
-    onChange,
-    title,
-  }: {
-    value: UploadDefaults;
-    onChange: (v: UploadDefaults) => void;
-    title?: string;
-  }) => (
-    <div className="flex-1 space-y-2">
-      {title && <p className="text-xs font-semibold text-muted-foreground">{title}</p>}
-      <div className="space-y-1">
-        <label className="text-[11px] text-muted-foreground">Default Ceiling Height</label>
-        <FtInStepper
-          totalIn={value.ceilingHeightIn}
-          onChange={(v) => onChange({ ...value, ceilingHeightIn: v })}
-          min={1}
-        />
-      </div>
-      <div className="space-y-1">
-        <label className="text-[11px] text-muted-foreground">Default Door Height</label>
-        <Select
-          value={String(value.defaultDoorHeightIn)}
-          onValueChange={(v) => onChange({ ...value, defaultDoorHeightIn: Number(v) })}
-        >
-          <SelectTrigger className="h-8 text-xs w-full [&>span]:flex-1 [&>span]:text-center">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value={"80"} className="text-xs">6'-8"</SelectItem>
-            <SelectItem value={"96"} className="text-xs">8'-0"</SelectItem>
-          </SelectContent>
-        </Select>
-      </div>
-    </div>
-  );
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -1555,6 +1573,21 @@ export default function FloorPlanEditor() {
   // been scale-calibrated and `runAutoLinkAndAlign` has executed.
   const pendingMultiFloorLinkRef = useRef<boolean>(false);
   const calibratedFloorsRef = useRef<Set<1 | 2>>(new Set());
+  // Preserve raw import-time furniture geometry (pre-snap, in JSON pixel
+  // coordinates) so scale calibration always snaps based on the ORIGINAL
+  // detected dimensions rather than a previously (mis)calibrated size.
+  const originalFurnitureRef = useRef<Record<1 | 2, FurnitureItem[]>>({
+    1: [],
+    2: [],
+  });
+  // Cumulative scale factor from JSON import pixels → current world pixels,
+  // per floor. Starts at 1; each calibration multiplies by that pass's
+  // scaleFactor. Used with originalFurnitureRef to rebuild snapped sizes
+  // from the original JSON geometry.
+  const importScaleRef = useRef<Record<1 | 2, number>>({ 1: 1, 2: 1 });
+  // IDs of Floor 1 master stairs currently injected onto Floor 2. Used to
+  // detect deletions on Floor 2 and propagate them back to Floor 1.
+  const injectedMasterIdsRef = useRef<Set<string>>(new Set());
   // Floor alignment manual override dialog state.
   const [alignDialogOpen, setAlignDialogOpen] = useState(false);
 
@@ -1571,6 +1604,7 @@ export default function FloorPlanEditor() {
     floor: allMaterials.find((m) => m.category === "floor" && m.is_default),
     wall: allMaterials.find((m) => m.category === "wall" && m.is_default),
     baseboard: allMaterials.find((m) => m.category === "baseboard" && m.is_default),
+    stairs: allMaterials.find((m) => m.category === "stairs" && m.is_default),
   }), [allMaterials]);
   const defaultAssets = useMemo(() => ({
     door: allAssets.find((a) => a.category === "door" && a.is_default),
@@ -1597,6 +1631,8 @@ export default function FloorPlanEditor() {
   const [exposure, setExposure] = useState<number>(1.0);
   const [nightMode, setNightMode] = useState<boolean>(false);
   const [scene3DKey, setScene3DKey] = useState(0); // bump to reset camera
+  const [tool3D, setTool3D] = useState<"orbit" | "plan" | "scene">("orbit");
+  const [topDownNonce, setTopDownNonce] = useState(0);
   const [visibleFloor, setVisibleFloor] = useState<"ALL" | 1 | 2>("ALL");
   const [floorSnapshotTick, setFloorSnapshotTick] = useState(0);
 
@@ -1977,6 +2013,17 @@ export default function FloorPlanEditor() {
             snapFurnitureDimensions(f, +data.metadata.px_per_foot),
           )
         : loadedFurniture;
+      // Stash raw pre-snap JSON geometry so calibration can always rebuild
+      // sizes from originals. Reset the cumulative import→world scale.
+      const targetFloor: 1 | 2 = (floorIndex ?? 1) as 1 | 2;
+      originalFurnitureRef.current[targetFloor] = loadedFurniture.map((f: any) => ({
+        ...f,
+        corners: f.corners.map((c: Pt) => ({ x: c.x, y: c.y })),
+        back_edge: f.back_edge
+          ? { p1: { ...f.back_edge.p1 }, p2: { ...f.back_edge.p2 } }
+          : undefined,
+      }));
+      importScaleRef.current[targetFloor] = 1;
       const snapTexts: TextItem[] = Array.isArray(data?.text)
         ? data.text.map((t: any, i: number) => ({
             id: t.id || generateId(`text_${i}`),
@@ -2012,11 +2059,12 @@ export default function FloorPlanEditor() {
               const norm = normalizeStairPolygonFromJson(polygon, shape, widthPx);
               const dirRaw = typeof s.direction === "string" ? s.direction.toUpperCase() : undefined;
               const direction = dirRaw === "UP" || dirRaw === "DN" ? (dirRaw as "UP" | "DN") : undefined;
-              const sp = s.start_point ?? s.start;
-              const ep = s.end_point ?? s.end;
-              const start = sp && sp.x != null && sp.y != null ? { x: +sp.x, y: +sp.y } : undefined;
-              const end = ep && ep.x != null && ep.y != null ? { x: +ep.x, y: +ep.y } : undefined;
-              loadedStructures.push({ id, kind: "stairs", polygon: norm.polygon, shape, width_in, rotation_rad: norm.rotation_rad, rotation_anchor: norm.anchor, direction, start, end });
+              // Do NOT carry start/end from JSON — legacy coords rarely match
+              // the normalized polygon. Leaving them undefined makes JSON
+              // stairs behave identically to newly-created ones: start/end
+              // are derived from the polygon's open ends on demand.
+              loadedStructures.push({ id, kind: "stairs", polygon: norm.polygon, shape, width_in, rotation_rad: norm.rotation_rad, rotation_anchor: norm.anchor, direction });
+
             }
           }
         });
@@ -2070,11 +2118,9 @@ export default function FloorPlanEditor() {
               const norm = normalizeStairPolygonFromJson(polygon, shape, widthPx);
               const dirRaw = typeof s.direction === "string" ? s.direction.toUpperCase() : undefined;
               const direction = dirRaw === "UP" || dirRaw === "DN" ? (dirRaw as "UP" | "DN") : undefined;
-              const sp = s.start_point ?? s.start;
-              const ep = s.end_point ?? s.end;
-              const start = sp && sp.x != null && sp.y != null ? { x: +sp.x, y: +sp.y } : undefined;
-              const end = ep && ep.x != null && ep.y != null ? { x: +ep.x, y: +ep.y } : undefined;
-              loadedStructures.push({ id, kind: "stairs", polygon: norm.polygon, shape, width_in, rotation_rad: norm.rotation_rad, rotation_anchor: norm.anchor, direction, start, end });
+              // See note above — start/end are derived from geometry, not JSON.
+              loadedStructures.push({ id, kind: "stairs", polygon: norm.polygon, shape, width_in, rotation_rad: norm.rotation_rad, rotation_anchor: norm.anchor, direction });
+
             }
           }
         });
@@ -2151,16 +2197,29 @@ export default function FloorPlanEditor() {
       }
       ownStructures = own;
       const s1 = floorSnapshotsRef.current[1];
-      if (s1 && editedMasters.length) {
+      if (s1) {
         const byId = new Map(editedMasters.map((m: any) => [m.id, m]));
+        const presentIds = new Set(editedMasters.map((m: any) => m.id));
+        // Any master that was injected but is no longer in `structures`
+        // was deleted by the user on Floor 2 → remove it from Floor 1.
+        const deletedIds = new Set<string>();
+        for (const id of injectedMasterIdsRef.current) {
+          if (!presentIds.has(id)) deletedIds.add(id);
+        }
         floorSnapshotsRef.current[1] = {
           ...s1,
-          structures: (s1.structures as any[]).map((s: any) =>
-            s?.kind === "stairs" && byId.has(s.id) ? { ...s, ...byId.get(s.id) } : s,
-          ),
+          structures: (s1.structures as any[])
+            .filter((s: any) => !(s?.kind === "stairs" && deletedIds.has(s.id)))
+            .map((s: any) =>
+              s?.kind === "stairs" && byId.has(s.id) ? { ...s, ...byId.get(s.id) } : s,
+            ),
         };
+        // Keep injected-ids set in sync so a subsequent save doesn't
+        // re-delete something that was already reconciled.
+        for (const id of deletedIds) injectedMasterIdsRef.current.delete(id);
       }
     }
+
     floorSnapshotsRef.current[activeFloor] = {
       planName,
       pixelsPerFoot,
@@ -2201,9 +2260,14 @@ export default function FloorPlanEditor() {
   const injectMastersForFloor2 = useCallback(() => {
     const s1 = floorSnapshotsRef.current[1];
     if (!s1) return;
+    // Project ALL Floor 1 stairs onto Floor 2 as transparent, editable
+    // masters — regardless of whether they were auto-linked to an L2 DN
+    // stair by `buildMasterStairs`. Newly-drawn L1 stairs should also
+    // appear as transparent holes on the floor above.
     const masters = (s1.structures as any[]).filter(
-      (s: any) => s?.kind === "stairs" && s.spans_to_floor === 2,
+      (s: any) => s?.kind === "stairs",
     );
+    injectedMasterIdsRef.current = new Set(masters.map((m: any) => m.id));
     setStructures((cur: any[]) => [
       ...cur.filter((s: any) => !s?.__from_master_floor),
       ...masters.map((m: any) => ({ ...m, __from_master_floor: 1 })),
@@ -2390,6 +2454,19 @@ export default function FloorPlanEditor() {
           }
         }
       }
+      if (defaultMaterials.stairs) {
+        const assignment = matToAssignment(defaultMaterials.stairs);
+        for (const s of structures) {
+          if (s.kind !== "stairs") continue;
+          for (const prefix of ["stair_tread_", "stair_riser_", "stair_stringer_"]) {
+            const key = `${prefix}${s.id}`;
+            if (!next[key]?.material) {
+              next[key] = { ...next[key], material: assignment };
+              changed = true;
+            }
+          }
+        }
+      }
       return changed ? next : m;
     });
 
@@ -2425,7 +2502,7 @@ export default function FloorPlanEditor() {
     // its own setDoors/setWindows calls. Defaults are also injected at
     // creation time and on plan load (planName dep), so this set of deps
     // covers every legitimate trigger without risking a feedback loop.
-  }, [planName, defaultMaterials, defaultAssets, materialsLoading, assetsLoading, matToAssignment]);
+  }, [planName, defaultMaterials, defaultAssets, materialsLoading, assetsLoading, matToAssignment, structures]);
 
 
   // Auto-fit on load
@@ -2694,18 +2771,90 @@ export default function FloorPlanEditor() {
         };
       });
 
-      const sFurniture = furniture
-        .map((f) => ({
+      // Rebuild snapped furniture sizes using ORIGINAL JSON dimensions
+      // multiplied by the cumulative import→world factor (so sizes snap
+      // correctly even if the drawing was previously miscalibrated), but
+      // KEEP each item's current position by scaling its current back_edge
+      // like the walls. This prevents furniture from drifting relative to
+      // walls across multiple calibrations.
+      const newImportScale = importScaleRef.current[activeFloor] * scaleFactor;
+      const origById = new Map(
+        (originalFurnitureRef.current[activeFloor] ?? []).map((o) => [o.id, o]),
+      );
+      const scalePt = (p: Pt, s: number): Pt => ({ x: p.x * s, y: p.y * s });
+
+      // Derive width/length/type for a snapped-from-raw item without touching
+      // its position. Returns null when there is no usable raw geometry.
+      const deriveTarget = (orig?: FurnitureItem) => {
+        if (!orig || !orig.corners || orig.corners.length < 3 || !orig.back_edge) return null;
+        const rawScaled: FurnitureItem = {
+          ...orig,
+          corners: orig.corners.map((c) => scalePt(c, newImportScale)),
+          back_edge: {
+            p1: scalePt(orig.back_edge.p1, newImportScale),
+            p2: scalePt(orig.back_edge.p2, newImportScale),
+          },
+        };
+        const snapped = snapFurnitureDimensions(rawScaled, PIXELS_PER_WORLD_FOOT);
+        if (!snapped.back_edge || snapped.corners.length < 3) return null;
+        const { p1, p2 } = snapped.back_edge;
+        const tw = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+        if (tw < 1e-6) return null;
+        const ux = (p2.x - p1.x) / tw, uy = (p2.y - p1.y) / tw;
+        const ax = (p1.x + p2.x) / 2, ay = (p1.y + p2.y) / 2;
+        const cgx = snapped.corners.reduce((s, c) => s + c.x, 0) / snapped.corners.length;
+        const cgy = snapped.corners.reduce((s, c) => s + c.y, 0) / snapped.corners.length;
+        let nx = -uy, ny = ux;
+        if ((cgx - ax) * nx + (cgy - ay) * ny < 0) { nx = -nx; ny = -ny; }
+        let tl = 0;
+        for (const c of snapped.corners) {
+          const d = (c.x - ax) * nx + (c.y - ay) * ny;
+          if (d > tl) tl = d;
+        }
+        if (tl < 1e-6) tl = tw;
+        return { type: snapped.type, tw, tl };
+      };
+
+      const sFurniture = furniture.map((f) => {
+        // Always scale current position/orientation like walls so the item
+        // stays anchored to its current spot in the plan.
+        const scaledCurrent: FurnitureItem = {
           ...f,
-          corners: f.corners.map((c) => ({ x: c.x * scaleFactor, y: c.y * scaleFactor })),
+          corners: f.corners.map((c) => scalePt(c, scaleFactor)),
           back_edge: f.back_edge
             ? {
-                p1: { x: f.back_edge.p1.x * scaleFactor, y: f.back_edge.p1.y * scaleFactor },
-                p2: { x: f.back_edge.p2.x * scaleFactor, y: f.back_edge.p2.y * scaleFactor },
+                p1: scalePt(f.back_edge.p1, scaleFactor),
+                p2: scalePt(f.back_edge.p2, scaleFactor),
               }
             : undefined,
-        }))
-        .map((f) => snapFurnitureDimensions(f, PIXELS_PER_WORLD_FOOT));
+        };
+        const target = deriveTarget(origById.get(f.id));
+        if (!target || !scaledCurrent.back_edge) {
+          // No raw available (item added after import) → snap from current.
+          return snapFurnitureDimensions(scaledCurrent, PIXELS_PER_WORLD_FOOT);
+        }
+        // Apply target width/length at the current (scaled) back_edge anchor.
+        const { p1, p2 } = scaledCurrent.back_edge;
+        const cw = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+        if (cw < 1e-6) return snapFurnitureDimensions(scaledCurrent, PIXELS_PER_WORLD_FOOT);
+        const ux = (p2.x - p1.x) / cw, uy = (p2.y - p1.y) / cw;
+        const ax = (p1.x + p2.x) / 2, ay = (p1.y + p2.y) / 2;
+        const cgx = scaledCurrent.corners.reduce((s, c) => s + c.x, 0) / scaledCurrent.corners.length;
+        const cgy = scaledCurrent.corners.reduce((s, c) => s + c.y, 0) / scaledCurrent.corners.length;
+        let nx = -uy, ny = ux;
+        if ((cgx - ax) * nx + (cgy - ay) * ny < 0) { nx = -nx; ny = -ny; }
+        const bl = { x: ax - (ux * target.tw) / 2, y: ay - (uy * target.tw) / 2 };
+        const br = { x: ax + (ux * target.tw) / 2, y: ay + (uy * target.tw) / 2 };
+        const fr = { x: br.x + nx * target.tl, y: br.y + ny * target.tl };
+        const fl = { x: bl.x + nx * target.tl, y: bl.y + ny * target.tl };
+        return {
+          ...scaledCurrent,
+          type: target.type,
+          corners: [bl, br, fr, fl],
+          back_edge: { p1: bl, p2: br },
+        };
+      });
+      importScaleRef.current[activeFloor] = newImportScale;
       const sTexts = texts.map((t) => ({
         ...t,
         x: t.x * scaleFactor,
@@ -2721,12 +2870,21 @@ export default function FloorPlanEditor() {
             thickness: DEFAULT_RAILING_THICKNESS_IN * PIXELS_PER_WORLD_INCH,
           };
         }
+        const scaledPoly = s.polygon.map((p) => ({ x: p.x * scaleFactor, y: p.y * scaleFactor }));
+        // Snap stair width to the nearest standard (36/42/48 in) and rebuild
+        // the polygon at that width in world units — preserving orientation
+        // and center — so calibrated stairs render at a real-world width
+        // regardless of what the raw polygon short side scaled to.
+        const shape = s.shape ?? detectStairShape(scaledPoly);
+        const snappedWidthIn = snapStairWidth(s.width_in ?? detectStairWidthIn(scaledPoly, PIXELS_PER_WORLD_FOOT));
+        const widthPx = snappedWidthIn * PIXELS_PER_WORLD_INCH;
+        const norm = normalizeStairPolygonFromJson(scaledPoly, shape, widthPx);
         return {
           ...s,
-          polygon: s.polygon.map((p) => ({ x: p.x * scaleFactor, y: p.y * scaleFactor })),
-          rotation_anchor: s.rotation_anchor
-            ? { x: s.rotation_anchor.x * scaleFactor, y: s.rotation_anchor.y * scaleFactor }
-            : undefined,
+          shape,
+          width_in: snappedWidthIn,
+          polygon: norm.polygon,
+          rotation_anchor: norm.anchor,
         };
       });
 
@@ -3170,7 +3328,8 @@ export default function FloorPlanEditor() {
         const wPx = pendingFurniture.widthIn * PIXELS_PER_WORLD_INCH;
         const lPx = pendingFurniture.lengthIn * PIXELS_PER_WORLD_INCH;
         // Anchor (back-edge center) at click. Footprint extends forward (down +y).
-        const ax = sp.x, ay = sp.y;
+        const ag = computeAlignmentSnap(sp.x, sp.y);
+        const ax = ag.x, ay = ag.y;
         const corners: Pt[] = [
           { x: ax - wPx / 2, y: ay },           // back-left
           { x: ax + wPx / 2, y: ay },           // back-right
@@ -3198,20 +3357,24 @@ export default function FloorPlanEditor() {
         pushHistory();
         const width_in = DEFAULT_STAIR_WIDTH_IN;
         const widthPx = inchesToPx(width_in);
-        // Default dimensions per shape (in inches)
+        // Default dimensions per shape (in inches). Leg run-lengths are
+        // rounded to whole-tread multiples of the canonical tread depth so
+        // the initial 2D footprint matches integer step counts.
+        const treadIn = 10.5;
+        const snapRun = (inches: number) =>
+          Math.max(treadIn, Math.round(inches / treadIn) * treadIn);
         let bboxW = 0, bboxH = 0;
         if (pendingStairShape === "straight") {
-          bboxW = inchesToPx(120); // 10ft length
-          bboxH = widthPx;          // 3ft width
+          bboxW = inchesToPx(snapRun(120)); // ~10ft run snapped to tread mult
+          bboxH = widthPx;
         } else if (pendingStairShape === "L") {
-          // legs of 5ft (60") each; bbox side = leg + width
-          bboxW = inchesToPx(60) + widthPx;
-          bboxH = inchesToPx(60) + widthPx;
+          bboxW = inchesToPx(snapRun(60)) + widthPx;
+          bboxH = inchesToPx(snapRun(60)) + widthPx;
         } else {
-          // U: legs 5ft, gap 2ft → bbox: width = 2*stairW + gap, height = leg + stairW
           bboxW = widthPx * 2 + inchesToPx(24);
-          bboxH = inchesToPx(60) + widthPx;
+          bboxH = inchesToPx(snapRun(60)) + widthPx;
         }
+
         const bbox = { x: sp.x - bboxW / 2, y: sp.y - bboxH / 2, w: bboxW, h: bboxH };
         const polygon = buildStairPolygonForShape(pendingStairShape, bbox, widthPx);
         const newId = generateId("stairs");
@@ -3340,7 +3503,13 @@ export default function FloorPlanEditor() {
         }
         setMousePos({ x: fx, y: fy });
         setDrawPreview(null);
-      } else if (drawMode === "text" || drawMode === "furniture" || drawMode === "stairs") {
+      } else if (drawMode === "furniture") {
+        const ag = computeAlignmentSnap(svgPoint.x, svgPoint.y);
+        activeGuides = ag.guides;
+        setMousePos({ x: ag.x, y: ag.y });
+        setDrawPreview(null);
+        setSnapIndicator(null);
+      } else if (drawMode === "text" || drawMode === "stairs") {
         setDrawPreview(null);
         setSnapIndicator(null);
       } else {
@@ -3440,9 +3609,45 @@ export default function FloorPlanEditor() {
       const newAnchorX = origAnchor.x + dx;
       const newAnchorY = origAnchor.y + dy;
       const ag = computeAlignmentSnap(newAnchorX, newAnchorY);
-      const adjDx = ag.x - origAnchor.x;
-      const adjDy = ag.y - origAnchor.y;
+      let adjDx = ag.x - origAnchor.x;
+      let adjDy = ag.y - origAnchor.y;
+      // Snap this furniture's axis-aligned bbox edges to nearby other
+      // furniture bbox edges (any of min/max on X and Y).
+      {
+        const tol = CONFIG.snapDistancePx / viewport.zoom;
+        const bx: number[] = drag.origCorners.map((c) => c.x);
+        const by: number[] = drag.origCorners.map((c) => c.y);
+        const dragMinX = Math.min(...bx) + adjDx;
+        const dragMaxX = Math.max(...bx) + adjDx;
+        const dragMinY = Math.min(...by) + adjDy;
+        const dragMaxY = Math.max(...by) + adjDy;
+        let bestDx = tol, offX: number | null = null;
+        let bestDy = tol, offY: number | null = null;
+        for (const other of furniture) {
+          if (other.id === drag.id) continue;
+          if (!other.corners || other.corners.length < 3) continue;
+          const oxs = other.corners.map((c) => c.x);
+          const oys = other.corners.map((c) => c.y);
+          const oMinX = Math.min(...oxs), oMaxX = Math.max(...oxs);
+          const oMinY = Math.min(...oys), oMaxY = Math.max(...oys);
+          for (const target of [oMinX, oMaxX]) {
+            for (const src of [dragMinX, dragMaxX]) {
+              const d = Math.abs(src - target);
+              if (d < bestDx) { bestDx = d; offX = target - src; }
+            }
+          }
+          for (const target of [oMinY, oMaxY]) {
+            for (const src of [dragMinY, dragMaxY]) {
+              const d = Math.abs(src - target);
+              if (d < bestDy) { bestDy = d; offY = target - src; }
+            }
+          }
+        }
+        if (offX !== null) adjDx += offX;
+        if (offY !== null) adjDy += offY;
+      }
       setAlignmentGuides(ag.guides);
+
       setFurniture((prev) =>
         prev.map((f) =>
           f.id !== drag.id
@@ -3722,8 +3927,15 @@ export default function FloorPlanEditor() {
       const ldx = wdx * cs - wdy * sn;
       const ldy = wdx * sn + wdy * cs;
       let delta = drag.axis === "x" ? ldx : ldy;
+      // Snap flight-length / U-gap changes to whole-tread increments so 2D
+      // resizes always match a valid step count (matches StairMesh's 10.5"
+      // preferred tread depth).
+      const treadDepthPx = inchesToPx(10.5);
+      delta = Math.round(delta / treadDepthPx) * treadDepthPx;
       // Clamp so the moving group keeps at least 12px (~1ft) gap from the
-      // opposite (non-moving) vertices along the same axis.
+      // opposite (non-moving) vertices along the same axis. Round the clamp
+      // limit toward the nearest tread multiple that still satisfies the gap
+      // so we don't silently break the snap.
       const idxSet = new Set(drag.vertexIndices);
       const movingCoords = drag.origPolygon
         .map((p, i) => (idxSet.has(i) ? (drag.axis === "x" ? p.x : p.y) : null))
@@ -3741,12 +3953,17 @@ export default function FloorPlanEditor() {
       if (drag.sign === 1) {
         const otherMax = Math.max(...otherCoords);
         const movingMin = Math.min(...movingCoords);
-        if (movingMin + delta < otherMax + minGap) delta = otherMax + minGap - movingMin;
+        if (movingMin + delta < otherMax + minGap) {
+          delta = Math.ceil((otherMax + minGap - movingMin) / treadDepthPx) * treadDepthPx;
+        }
       } else {
         const otherMin = Math.min(...otherCoords);
         const movingMax = Math.max(...movingCoords);
-        if (movingMax + delta > otherMin - minGap) delta = otherMin - minGap - movingMax;
+        if (movingMax + delta > otherMin - minGap) {
+          delta = Math.floor((otherMin - minGap - movingMax) / treadDepthPx) * treadDepthPx;
+        }
       }
+
       const d = delta;
       setStructures((prev) =>
         prev.map((s) => {
@@ -3924,9 +4141,12 @@ export default function FloorPlanEditor() {
         single_couch: Custom_Single_Couch,
         double_couch: Custom_Double_Couch,
         triple_couch: Custom_Triple_Couch,
-        counter: Custom_Single_Cabinet,
-        single_counter: Custom_Single_Cabinet,
-        double_counter: Custom_Double_Cabinet,
+        counter: Custom_Single_Counter,
+        single_counter: Custom_Single_Counter,
+        double_counter: Custom_Double_Counter,
+        cabinet: Custom_Single_Counter,
+        single_cabinet: Custom_Single_Counter,
+        double_cabinet: Custom_Double_Counter,
         kitchen_island: Custom_Kitchen_Island,
       };
       const lengthComponents: Record<string, any> = {
@@ -3981,10 +4201,8 @@ export default function FloorPlanEditor() {
         >
           <polygon
             points={points}
-            fill="oklch(0.9 0.05 45)"
-            fillOpacity={0.5}
-            stroke={stroke}
-            strokeWidth={1}
+            fill="transparent"
+            stroke="none"
           />
           <g transform={`rotate(${safeAngle} ${safeAnchorX} ${safeAnchorY})${f.flipLR ? ` translate(${2 * safeAnchorX} 0) scale(-1 1)` : ""}`} style={{ pointerEvents: "none" }}>
             {LengthComp ? (
@@ -4026,7 +4244,7 @@ export default function FloorPlanEditor() {
 
 
   const renderStructures = () => {
-    const treadInPx = inchesToPx(11);
+    const treadInPx = inchesToPx(10.5);
     const balusterSpacingPx = inchesToPx(5);
     const balusterSizePx = inchesToPx(1.5);
 
@@ -5710,7 +5928,15 @@ export default function FloorPlanEditor() {
                       const dx = target.x - (builtBbox.x + builtBbox.w / 2);
                       const dy = target.y - (builtBbox.y + builtBbox.h / 2);
                       const newPoly = built.map((p) => ({ x: p.x + dx, y: p.y + dy }));
-                      return { ...s, shape: newShape, polygon: newPoly, rotation_anchor: target };
+                      // Reset start/end so JSON-loaded stairs behave exactly
+                      // like newly-created ones after a shape switch — open
+                      // ends are re-derived from the new archetype polygon.
+                      // Keep rotation_anchor identical: if the stair has been
+                      // rotated, changing the anchor while rotation_rad != 0
+                      // makes the visual position jump (rotate-about-anchor
+                      // uses the new anchor with the old rotation).
+                      return { ...s, shape: newShape, polygon: newPoly, rotation_anchor: s.rotation_anchor ?? target, start: undefined, end: undefined };
+
                     }),
                   );
                 };
@@ -5722,7 +5948,12 @@ export default function FloorPlanEditor() {
                       if (s.id !== selectedId || s.kind !== "stairs") return s;
                       const sh = s.shape ?? "straight";
                       const curBbox = polygonBbox(s.polygon);
-                      const target = s.rotation_anchor ?? polygonBboxCenter(s.polygon);
+                      // Always use the CURRENT polygon bbox center. A stale
+                      // rotation_anchor (set at creation and not refreshed when the
+                      // user drags open-end handles) caused the first width change to
+                      // translate the stair to that old center; subsequent changes
+                      // then stayed put because rotation_anchor had just been refreshed.
+                      const target = polygonBboxCenter(s.polygon);
                       let resized: Pt[];
                       if (sh === "straight") {
                         resized = enforceStraightStairWidth(s.polygon, widthPx);
@@ -5736,7 +5967,17 @@ export default function FloorPlanEditor() {
                       const dx = target.x - (rBbox.x + rBbox.w / 2);
                       const dy = target.y - (rBbox.y + rBbox.h / 2);
                       const newPoly = resized.map((p) => ({ x: p.x + dx, y: p.y + dy }));
-                      return { ...s, width_in: newWidthIn, polygon: newPoly, rotation_anchor: target };
+                      // Reset start/end so the 3D renderer re-derives entry/exit
+                      // midpoints from the resized polygon. Otherwise a stale start
+                      // (from the old width) shifts Flight #2's landing perpendicular
+                      // to Flight #1 by ±(newWidth - oldWidth)/2 in world space —
+                      // making an L/U stair against a wall drift into or away from it.
+                      // Straight stairs anchor Flight #1 symmetrically so this only
+                      // visibly affects L/U shapes.
+                      // Keep rotation_anchor identical for the same reason as
+                      // changeShape: mutating the pivot while rotation_rad != 0
+                      // teleports the stair on-screen.
+                      return { ...s, width_in: newWidthIn, polygon: newPoly, rotation_anchor: s.rotation_anchor ?? target, start: undefined, end: undefined };
                     }),
                   );
                 };
@@ -5790,28 +6031,8 @@ export default function FloorPlanEditor() {
                         </SelectContent>
                       </Select>
                     </div>
-                    <div>
-                      <label className="text-xs text-muted-foreground mb-1.5 block">Treads (steps)</label>
-                      <Input
-                        type="number"
-                        min={2}
-                        max={30}
-                        value={selectedStairs.tread_count ?? 13}
-                        onChange={(e) => {
-                          const n = Math.max(2, Math.min(30, Math.floor(Number(e.target.value) || 0)));
-                          pushHistory();
-                          setStructures((prev) =>
-                            prev.map((st) =>
-                              st.id === selectedId && st.kind === "stairs"
-                                ? { ...st, tread_count: n }
-                                : st,
-                            ),
-                          );
-                        }}
-                        className="h-8 text-xs"
-                      />
-                    </div>
                     <div className="flex justify-between text-xs">
+
                       <span className="text-muted-foreground">Run length</span>
                       <span className="font-mono text-foreground">
                         {formatFtIn(pxToInches(longPx))}
@@ -6620,6 +6841,212 @@ export default function FloorPlanEditor() {
             </section>
           )}
 
+          {/* 3D Material Picker — when a stair is selected. Three groups
+              (treads+landings, risers, stringers) each hidden under an
+              accordion; opening one reveals its material picker + tile scale
+              + tint. */}
+          {viewMode === "3D" && selection3D && selection3D.kind === "stairs" && (
+            <section>
+              <h2 className="text-[11px] uppercase tracking-wider text-muted-foreground mb-2 font-semibold">
+                Stairs Material
+              </h2>
+              {(() => {
+                const stairId = selection3D.id;
+                const filteredMaterials = allMaterials.filter((mat) => mat.category === "stairs");
+                const allStairIds = structures.filter((s) => s.kind === "stairs").map((s) => s.id);
+
+                const matToAssignment = (mat: typeof allMaterials[number]) => ({
+                  color_url: mat.color_url,
+                  roughness_url: mat.roughness_url,
+                  normal_url: mat.normal_url,
+                  ao_url: mat.ao_url,
+                  metallic_url: mat.metallic_url,
+                });
+
+                const GROUPS: { key: "tread" | "riser" | "stringer"; label: string }[] = [
+                  { key: "tread", label: "All Treads + Landings" },
+                  { key: "riser", label: "All Risers" },
+                  { key: "stringer", label: "All Stringers" },
+                ];
+
+                const renderGroup = (groupKey: "tread" | "riser" | "stringer") => {
+                  const metadataKey = `stair_${groupKey}_${stairId}`;
+                  const currentMaterial = visualMetadata[metadataKey]?.material;
+                  const currentScale = visualMetadata[metadataKey]?.tile_scale ?? 1;
+                  const currentTint = visualMetadata[metadataKey]?.tint;
+
+                  const applyMaterial = (mat: typeof allMaterials[number]) =>
+                    setVisualMetadata((m) => ({
+                      ...m,
+                      [metadataKey]: { ...m[metadataKey], material: matToAssignment(mat) },
+                    }));
+                  const setScale = (s: number) =>
+                    setVisualMetadata((m) => ({
+                      ...m,
+                      [metadataKey]: { ...m[metadataKey], tile_scale: s },
+                    }));
+                  const setTint = (t: string) =>
+                    setVisualMetadata((m) => ({
+                      ...m,
+                      [metadataKey]: { ...m[metadataKey], tint: t },
+                    }));
+                  const clearTint = () =>
+                    setVisualMetadata((m) => {
+                      const next = { ...m[metadataKey] };
+                      delete next.tint;
+                      return { ...m, [metadataKey]: next };
+                    });
+                  const clearMaterial = () =>
+                    setVisualMetadata((m) => {
+                      const next = { ...m[metadataKey] };
+                      delete next.material;
+                      return { ...m, [metadataKey]: next };
+                    });
+                  const applyToAll = () => {
+                    setVisualMetadata((m) => {
+                      const next = { ...m };
+                      for (const id of allStairIds) {
+                        const k = `stair_${groupKey}_${id}`;
+                        const entry = { ...next[k] };
+                        if (currentMaterial) {
+                          entry.material = currentMaterial;
+                          entry.tile_scale = currentScale;
+                        }
+                        if (currentTint) entry.tint = currentTint;
+                        else delete entry.tint;
+                        next[k] = entry;
+                      }
+                      return next;
+                    });
+                  };
+
+                  return (
+                    <div className="space-y-3 pt-1">
+                      <div className="flex items-center justify-end">
+                        {currentMaterial && (
+                          <button
+                            type="button"
+                            onClick={clearMaterial}
+                            className="text-[10px] text-muted-foreground hover:text-foreground underline"
+                          >
+                            Clear material
+                          </button>
+                        )}
+                      </div>
+                      {materialsLoading ? (
+                        <p className="text-xs text-muted-foreground rounded-md bg-muted/40 border border-border px-3 py-2.5">
+                          Fetching materials...
+                        </p>
+                      ) : materialsError ? (
+                        <p className="text-xs text-destructive rounded-md bg-destructive/10 border border-destructive/20 px-3 py-2.5">
+                          {materialsError}
+                        </p>
+                      ) : filteredMaterials.length === 0 ? (
+                        <p className="text-xs text-muted-foreground rounded-md bg-muted/40 border border-border px-3 py-2.5">
+                          No stair materials found. Add rows to the Materials table with category "stairs".
+                        </p>
+                      ) : (
+                        <div className="grid grid-cols-3 gap-2">
+                          {filteredMaterials.map((mat) => {
+                            const active = currentMaterial?.color_url === mat.color_url;
+                            return (
+                              <button
+                                key={mat.id}
+                                type="button"
+                                onClick={() => applyMaterial(mat)}
+                                className={cn(
+                                  "flex flex-col gap-1 rounded-md border-2 overflow-hidden bg-background transition-all text-left",
+                                  active
+                                    ? "border-primary ring-2 ring-primary/30"
+                                    : "border-border hover:border-primary/50",
+                                )}
+                                title={mat.name}
+                              >
+                                <div className="aspect-square w-full bg-muted overflow-hidden">
+                                  <img
+                                    src={mat.thumbnail_url}
+                                    alt={mat.name}
+                                    className="w-full h-full object-cover"
+                                    loading="lazy"
+                                  />
+                                </div>
+                                <div className="px-1.5 pb-1 text-[10px] leading-tight truncate">
+                                  {mat.name}
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                      <div className="space-y-1.5">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[11px] uppercase tracking-wider text-muted-foreground font-semibold">
+                            Tile scale
+                          </span>
+                          <span className="text-[11px] font-mono text-muted-foreground">
+                            {currentScale.toFixed(2)}×
+                          </span>
+                        </div>
+                        <Slider
+                          value={[currentScale]}
+                          min={0.1}
+                          max={5}
+                          step={0.05}
+                          onValueChange={(v) => setScale(v[0])}
+                        />
+                      </div>
+                      <TintPicker
+                        presets={MATERIAL_TINT_PRESETS}
+                        currentTint={currentTint}
+                        setTint={setTint}
+                        clearTint={clearTint}
+                      />
+                      {allStairIds.length > 1 && (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="w-full"
+                          disabled={!currentMaterial && !currentTint}
+                          onClick={applyToAll}
+                        >
+                          Apply to all stairs
+                        </Button>
+                      )}
+                    </div>
+                  );
+                };
+
+                return (
+                  <div className="rounded-md bg-card border border-border p-3">
+                    <Accordion type="single" collapsible className="w-full">
+                      {GROUPS.map((g) => {
+                        const metadataKey = `stair_${g.key}_${stairId}`;
+                        const hasMat = !!visualMetadata[metadataKey]?.material;
+                        const hasTint = !!visualMetadata[metadataKey]?.tint;
+                        return (
+                          <AccordionItem key={g.key} value={g.key}>
+                            <AccordionTrigger className="text-sm font-medium">
+                              <span className="flex items-center gap-2">
+                                {g.label}
+                                {(hasMat || hasTint) && (
+                                  <span className="h-1.5 w-1.5 rounded-full bg-primary" />
+                                )}
+                              </span>
+                            </AccordionTrigger>
+                            <AccordionContent>{renderGroup(g.key)}</AccordionContent>
+                          </AccordionItem>
+                        );
+                      })}
+                    </Accordion>
+                  </div>
+                );
+              })()}
+            </section>
+          )}
+
+
+
 
           {/* Model Picker — only when a door or window is selected, scoped to that category */}
           {viewMode === "3D" && selection3D && (selection3D.kind === "door" || selection3D.kind === "window") && !(selection3D.kind === "door" && doors.find((d) => d.id === selection3D.id)?.is_arch) && (
@@ -7083,25 +7510,65 @@ export default function FloorPlanEditor() {
                 Label
               </text>
             )}
-            {/* Furniture placement preview — ghost rectangle follows the cursor */}
+            {/* Furniture placement preview — ghost SVG follows the cursor */}
             {drawMode === "furniture" && pendingFurniture && (() => {
               const w = pendingFurniture.widthIn * PIXELS_PER_WORLD_INCH;
               const l = pendingFurniture.lengthIn * PIXELS_PER_WORLD_INCH;
+              const typeLower = pendingFurniture.type.toLowerCase();
+              const widthComponents: Record<string, any> = {
+                bath: Custom_Bathtub, bathtub: Custom_Bathtub, tub: Custom_Bathtub,
+                shower: Custom_Small_Shower, small_shower: Custom_Small_Shower, large_shower: Custom_Large_Shower,
+                stove: Custom_Stove, oven: Custom_Stove,
+                fridge: Custom_Fridge, refrigerator: Custom_Fridge,
+                sink: Custom_Single_Sink,
+                vanity: Custom_Single_Vanity, single_vanity: Custom_Single_Vanity, double_vanity: Custom_Double_Vanity,
+                couch: Custom_Single_Couch, sofa: Custom_Single_Couch,
+                single_couch: Custom_Single_Couch, double_couch: Custom_Double_Couch, triple_couch: Custom_Triple_Couch,
+                counter: Custom_Single_Counter, single_counter: Custom_Single_Counter, double_counter: Custom_Double_Counter,
+                cabinet: Custom_Single_Counter, single_cabinet: Custom_Single_Counter, double_cabinet: Custom_Double_Counter,
+                kitchen_island: Custom_Kitchen_Island,
+              };
+              const lengthComponents: Record<string, any> = {
+                toilet: Custom_Toilet,
+                bed: Custom_Queen_Bed, king_bed: Custom_King_Bed, queen_bed: Custom_Queen_Bed,
+                double_bed: Custom_Double_Bed, single_bed: Custom_Single_Bed,
+              };
+              const WidthComp = widthComponents[typeLower];
+              const LengthComp = lengthComponents[typeLower];
+              const stroke = COLORS.wall;
               return (
-                <g pointerEvents="none" opacity={0.6}>
-                  <rect
-                    x={mousePos.x - w / 2}
-                    y={mousePos.y}
-                    width={w}
-                    height={l}
-                    fill="oklch(0.9 0.05 45)"
-                    fillOpacity={0.5}
-                    stroke={COLORS.wall}
-                    strokeWidth={2 / viewport.zoom}
-                    strokeDasharray={`${6 / viewport.zoom} ${4 / viewport.zoom}`}
-                  />
-                  {/* anchor dot at back-edge center */}
-                  <circle cx={mousePos.x} cy={mousePos.y} r={3 / viewport.zoom} fill={COLORS.wall} />
+                <g pointerEvents="none" opacity={0.5}>
+                  {LengthComp ? (
+                    <LengthComp
+                      anchorX={mousePos.x}
+                      anchorY={mousePos.y}
+                      width={w}
+                      length={l}
+                      stroke={stroke}
+                      fill={typeLower.includes("bed") ? stroke : "#ffffff"}
+                    />
+                  ) : WidthComp ? (
+                    <WidthComp
+                      anchorX={mousePos.x}
+                      anchorY={mousePos.y}
+                      width={w}
+                      height={l}
+                      length={l}
+                      stroke={stroke}
+                      fill="none"
+                    />
+                  ) : (
+                    <rect
+                      x={mousePos.x - w / 2}
+                      y={mousePos.y}
+                      width={w}
+                      height={l}
+                      fill="none"
+                      stroke={stroke}
+                      strokeWidth={2 / viewport.zoom}
+                      strokeDasharray={`${6 / viewport.zoom} ${4 / viewport.zoom}`}
+                    />
+                  )}
                 </g>
               );
             })()}
@@ -7477,7 +7944,13 @@ export default function FloorPlanEditor() {
         )}
 
         {viewMode === "3D" && (
-          <div key={scene3DKey} className="absolute inset-0">
+          <div
+            key={scene3DKey}
+            className="absolute inset-0"
+            onMouseDown={() => {
+              if (tool3D === "scene") setTool3D("orbit");
+            }}
+          >
             <FloorPlan3D
               floorsData={floorsData3D}
               visibleFloor={visibleFloor}
@@ -7540,6 +8013,7 @@ export default function FloorPlanEditor() {
               sunWarmth={sunWarmth}
               exposure={exposure}
               onZoomChange={setZoom3D}
+              topDownNonce={topDownNonce}
             />
           </div>
         )}
@@ -7578,6 +8052,7 @@ export default function FloorPlanEditor() {
                     if (m === "3D") {
                       setDrawMode(null);
                       setDrawMenuOpen(false);
+                      setTool3D("orbit");
                     }
                   }}
                   className={cn(
@@ -8041,9 +8516,75 @@ export default function FloorPlanEditor() {
         </div>
         </>)}
 
-        {/* 3D right-side scene controls */}
+        {/* 3D right-side toolbar (orbit / plan / scene) */}
         {viewMode === "3D" && (
-          <div className="absolute top-1/2 -translate-y-1/2 right-4 z-20 w-[240px] max-h-[88vh] overflow-y-auto rounded-2xl border border-border bg-card/95 backdrop-blur shadow-xl p-3 space-y-3">
+          <div className="absolute top-1/2 -translate-y-1/2 right-4 z-30 flex flex-col gap-1 rounded-2xl border border-border bg-card/95 backdrop-blur shadow-xl p-1.5">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  aria-label="Orbit"
+                  onClick={() => setTool3D("orbit")}
+                  className={cn(
+                    "h-10 w-10 rounded-xl flex items-center justify-center transition-colors",
+                    tool3D === "orbit" ? "bg-primary text-primary-foreground shadow" : "hover:bg-accent text-foreground",
+                  )}
+                >
+                  <Orbit className="h-4 w-4" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent><p>Orbit — drag to rotate, scroll to zoom</p></TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  aria-label="Plan view"
+                  onClick={() => {
+                    setTopDownNonce((n) => n + 1);
+                    setTool3D("plan");
+                    window.setTimeout(() => setTool3D((t) => (t === "plan" ? "orbit" : t)), 350);
+                  }}
+                  className={cn(
+                    "h-10 w-10 rounded-xl flex items-center justify-center transition-colors",
+                    tool3D === "plan" ? "bg-primary text-primary-foreground shadow" : "hover:bg-accent text-foreground",
+                  )}
+                >
+                  <MapIcon className="h-4 w-4" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent><p>Plan — top-down view</p></TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  aria-label="Scene settings"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setTool3D((t) => (t === "scene" ? "orbit" : "scene"));
+                  }}
+                  className={cn(
+                    "h-10 w-10 rounded-xl flex items-center justify-center transition-colors",
+                    tool3D === "scene" ? "bg-primary text-primary-foreground shadow" : "hover:bg-accent text-foreground",
+                  )}
+                >
+                  <SunMedium className="h-4 w-4" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent><p>3D Scene — lighting &amp; sun</p></TooltipContent>
+            </Tooltip>
+          </div>
+        )}
+
+        {/* 3D right-side scene controls (slide-in panel) */}
+        {viewMode === "3D" && (
+          <div
+            onMouseDown={(e) => e.stopPropagation()}
+            className={cn(
+              "absolute top-1/2 -translate-y-1/2 right-20 z-20 w-[240px] max-h-[88vh] overflow-y-auto rounded-2xl border border-border bg-card/95 backdrop-blur shadow-xl p-3 space-y-3 transition-all duration-300 ease-out",
+              tool3D === "scene"
+                ? "translate-x-0 opacity-100 pointer-events-auto"
+                : "translate-x-[calc(100%+6rem)] opacity-0 pointer-events-none",
+            )}
+          >
             <div>
               <h3 className="text-[11px] uppercase tracking-wider text-muted-foreground font-semibold mb-2">3D Scene</h3>
               <p className="text-[11px] text-muted-foreground leading-snug">Drag to orbit · Right-drag to pan · Scroll to zoom</p>

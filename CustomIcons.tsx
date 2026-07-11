@@ -2215,7 +2215,7 @@ export const Custom_Fridge = ({
   );
 };
 
-export const Custom_Single_Cabinet = ({
+export const Custom_Single_Counter = ({
   x,
   y,
   width,
@@ -2281,7 +2281,7 @@ export const Custom_Single_Cabinet = ({
 };
 
 
-export const Custom_Double_Cabinet = ({
+export const Custom_Double_Counter = ({
   x,
   y,
   width,

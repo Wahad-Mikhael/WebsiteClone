@@ -1,6 +1,6 @@
 import { memo, useMemo, useRef, useLayoutEffect, useCallback, Suspense, useEffect } from "react";
 import { Canvas, useThree, type ThreeEvent } from "@react-three/fiber";
-import { OrbitControls, PerspectiveCamera, Environment, useTexture, Bvh } from "@react-three/drei";
+import { OrbitControls, PerspectiveCamera, Environment, useTexture, Bvh, Grid } from "@react-three/drei";
 import { EffectComposer, N8AO } from "@react-three/postprocessing";
 import * as THREE from "three";
 import LightingSystem from "./LightingSystem";
@@ -8,7 +8,7 @@ import { DoorInstance, WindowInstance, useModelPreload } from "./ModelSystem";
 import { Furniture3D } from "./Furniture3D";
 import type { AssetModel } from "@/lib/assets";
 import { SHARED_MATERIALS, SHARED_HOVER_MATERIALS, SHARED_STAIR_STRINGER_MATERIAL } from "@/lib/sharedMaterials";
-import { getStairInitialRunAngle, getStairTurnSign, type StairLike } from "@/lib/stairLogic";
+import { getStairInitialRunAngle, getStairTurnSign, getStairLegLengthsPx, getStairOpenEndMids, type StairLike } from "@/lib/stairLogic";
 
 export type Pt = { x: number; y: number };
 export type Floor = { id: string; polygon: Pt[] };
@@ -119,17 +119,62 @@ interface Props {
   sunWarmth?: number;
   exposure?: number;
   onZoomChange?: (zoom: number) => void;
+  /** Bump this number to snap the camera to a top-down plan view. */
+  topDownNonce?: number;
 }
 
 
 const DEFAULT_WALL_COLOR = "#e8e3dc";
-const DEFAULT_FLOOR_COLOR = "#c9b89c";
+const DEFAULT_FLOOR_COLOR = "rgb(201, 156, 156)";
 // Stable module-level raycast references. r3f applies props by assignment;
 // passing `undefined` after `() => null` leaves `mesh.raycast = undefined`,
 // silently disabling intersections. Passing a real function reference both
 // times restores hit-testing when a hidden floor is shown again.
 const DEFAULT_MESH_RAYCAST = THREE.Mesh.prototype.raycast;
 const NULL_RAYCAST = () => null;
+
+// Sky gradient background: white near the horizon fading to blue at zenith.
+// Rendered as a large inverted sphere with a simple vertex-lerp shader so it
+// stays cheap and never intersects scene geometry.
+function SkyBackground() {
+  const material = useMemo(() => {
+    return new THREE.ShaderMaterial({
+      side: THREE.BackSide,
+      depthWrite: false,
+      uniforms: {
+        topColor: { value: new THREE.Color("#7fb2ff") },
+        horizonColor: { value: new THREE.Color("#ffffff") },
+        exponent: { value: 0.75 },
+      },
+      vertexShader: `
+        varying vec3 vWorldPos;
+        void main() {
+          vec4 wp = modelMatrix * vec4(position, 1.0);
+          vWorldPos = wp.xyz;
+          gl_Position = projectionMatrix * viewMatrix * wp;
+        }
+      `,
+      fragmentShader: `
+        varying vec3 vWorldPos;
+        uniform vec3 topColor;
+        uniform vec3 horizonColor;
+        uniform float exponent;
+        void main() {
+          float h = normalize(vWorldPos).y;
+          float t = pow(max(h, 0.0), exponent);
+          gl_FragColor = vec4(mix(horizonColor, topColor, t), 1.0);
+        }
+      `,
+    });
+  }, []);
+  useEffect(() => () => material.dispose(), [material]);
+  return (
+    <mesh scale={[5000, 5000, 5000]} raycast={NULL_RAYCAST} frustumCulled={false}>
+      <sphereGeometry args={[1, 32, 16]} />
+      <primitive object={material} attach="material" />
+    </mesh>
+  );
+}
 
 // Dispose the previous BufferGeometry when a useMemo replaces it. R3F only
 // auto-disposes on unmount, so a wall/floor whose geometry rebuilds during a
@@ -1072,31 +1117,6 @@ interface StairFlightsResult {
   pieces: StairFlightPiece[];
 }
 
-function computeRunLengthPx(stair: StairsStructure3D, widthPx: number): number {
-  // Perimeter-based measure: for straight = long side; for L/U = sum of leg run
-  // lengths (perimeter along the run axes, discounting landing widths).
-  const b = (() => {
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const p of stair.polygon) {
-      if (p.x < minX) minX = p.x;
-      if (p.y < minY) minY = p.y;
-      if (p.x > maxX) maxX = p.x;
-      if (p.y > maxY) maxY = p.y;
-    }
-    return { w: maxX - minX, h: maxY - minY };
-  })();
-  const shape = stair.shape ?? "straight";
-  if (shape === "straight") return Math.max(b.w, b.h);
-  if (shape === "L") {
-    // Two legs share a widthPx × widthPx corner landing.
-    return Math.max(0, b.w - widthPx) + Math.max(0, b.h - widthPx);
-  }
-  // U — two long legs + connecting landing (widthPx deep).
-  // Run length ≈ 2 × (long leg - widthPx)
-  const longLeg = Math.max(b.w, b.h);
-  return Math.max(0, 2 * (longLeg - widthPx));
-}
-
 function buildStairFlights(
   stair: StairsStructure3D,
   totalHeight: number,
@@ -1106,38 +1126,60 @@ function buildStairFlights(
   stringerHeight: number,
   stringerThickness: number,
   turnSign: 1 | -1,
+  preferredTreadDepth: number,
 ): StairFlightsResult {
   const shape = stair.shape ?? "straight";
-  const nTreads = Math.max(2, Math.floor(stair.tread_count ?? 13));
-  const riserHeight = totalHeight / nTreads;
-  const runLength = computeRunLengthPx(stair, widthPx);
+  const legs = getStairLegLengthsPx(stair as StairLike, widthPx);
+  const totalRun = legs.reduce((a, b) => a + b, 0);
+  // Total step count derived from real 2D leg lengths and a preferred tread
+  // depth (~standard 10.5"). Landing height = f1Treads * riserHeight naturally.
+  const totalTreads = Math.max(
+    legs.length + 1,
+    Math.round(totalRun / Math.max(1, preferredTreadDepth)),
+  );
+  // Proportional per-flight tread distribution.
+  const raw = legs.map((l) => (l / totalRun) * totalTreads);
+  const flightTreads = raw.map((v) => Math.max(1, Math.floor(v)));
+  let diff = totalTreads - flightTreads.reduce((a, b) => a + b, 0);
+  const fracOrder = raw
+    .map((v, i) => ({ i, f: v - Math.floor(v) }))
+    .sort((a, b) => b.f - a.f);
+  let k = 0;
+  while (diff > 0 && fracOrder.length > 0) {
+    flightTreads[fracOrder[k % fracOrder.length].i]++;
+    diff--;
+    k++;
+  }
+  const treadDepth = totalRun / totalTreads;
+  const riserHeight = totalHeight / totalTreads;
   const pieces: StairFlightPiece[] = [];
 
   const riserThickness = Math.max(0.5, treadThickness * 0.5);
 
   const addFlight = (
     originX: number, originY: number, originZ: number,
-    rotY: number, treads: number, treadDepth: number,
+    rotY: number, treads: number, td: number,
   ) => {
     const cos = Math.cos(rotY);
     const sin = Math.sin(rotY);
     for (let i = 0; i < treads; i++) {
-      // Tread top surface at y = originY + (i+1)*riserHeight.
-      const treadCenterLocalX = i * treadDepth + treadDepth / 2;
+      // Nosing overhang extends toward the FRONT of the step (the leading
+      // edge you step onto as you ascend — higher local X).
+      const treadCenterLocalX = i * td + td / 2 - overhang / 2;
       const y = originY + (i + 1) * riserHeight - treadThickness / 2;
       const tx = originX + treadCenterLocalX * cos;
       const tz = originZ + treadCenterLocalX * sin;
       pieces.push({
         kind: "tread",
         x: tx, y, z: tz,
-        depth: treadDepth + overhang,
-        width: widthPx,
+        depth: td + overhang,
+        width: Math.max(0.1, widthPx - 2 * stringerThickness),
         thickness: treadThickness,
         rotY,
       });
-      // Riser i sits at the back edge of tread i, spanning from y=i*riserHeight
-      // to (i+1)*riserHeight − treadThickness (meeting underside of tread).
-      const riserLocalX = i * treadDepth - overhang / 2 - riserThickness / 2;
+      // Riser i sits at the back of tread i (behind its nosing).
+      const riserLocalX = i * td + riserThickness / 2;
+
       const riserHeightBox = Math.max(0.1, riserHeight - treadThickness);
       const riserY = originY + i * riserHeight + riserHeightBox / 2;
       const rx = originX + riserLocalX * cos;
@@ -1145,16 +1187,14 @@ function buildStairFlights(
       pieces.push({
         kind: "riser",
         x: rx, y: riserY, z: rz,
-        width: widthPx,
+        width: Math.max(0.1, widthPx - 2 * stringerThickness),
         height: riserHeightBox,
         thickness: riserThickness,
         rotY,
       });
+
     }
-    // Two diagonal stringers along ±Z sides of this flight. Position is the
-    // exact midpoint of THIS flight; rotZ (pitch) is applied in the flight's
-    // local frame at render time via nested groups, so it works for any rotY.
-    const flightRun = treads * treadDepth;
+    const flightRun = treads * td;
     const flightRise = treads * riserHeight;
     const stringerLength = Math.hypot(flightRun, flightRise);
     const pitch = Math.atan2(flightRise, flightRun);
@@ -1176,7 +1216,11 @@ function buildStairFlights(
         rotZ: pitch,
       });
     }
-    return { endX: originX + flightRun * cos, endZ: originZ + flightRun * sin, endY: originY + flightRise };
+    return {
+      endX: originX + flightRun * cos,
+      endZ: originZ + flightRun * sin,
+      endY: originY + flightRise,
+    };
   };
 
   const addLanding = (x: number, y: number, z: number, sizeX: number, sizeZ: number) => {
@@ -1188,47 +1232,57 @@ function buildStairFlights(
   };
 
   if (shape === "straight") {
-    const treadDepth = runLength / nTreads;
-    addFlight(0, 0, 0, 0, nTreads, treadDepth);
+    addFlight(0, 0, 0, 0, flightTreads[0], treadDepth);
   } else if (shape === "L") {
-    const f1 = Math.ceil(nTreads / 2);
-    const f2 = nTreads - f1;
-    const treadDepth = runLength / Math.max(1, f1 + f2);
-    const e1 = addFlight(0, 0, 0, 0, f1, treadDepth);
+    const e1 = addFlight(0, 0, 0, 0, flightTreads[0], treadDepth);
     const landingCX = e1.endX + widthPx / 2;
-    // Landing is aligned with flight 1 on Z (same width, same axis), extending
-    // outward on X only. Its near edge on Z is the OUTER edge of flight 1,
-    // not the centerline.
-    const landingCZ = 0;
     const landingY = e1.endY;
-    addLanding(landingCX, landingY, landingCZ, widthPx, widthPx);
-    // Flight 2 starts at the center of the landing on X and at the far Z edge
-    // of the landing (turn side), rotated ±90° per turnSign.
-    const f2StartX = landingCX;
+    addLanding(landingCX, landingY, 0, widthPx, widthPx);
+    addFlight(
+      landingCX, landingY, turnSign * (widthPx / 2),
+      turnSign * (Math.PI / 2), flightTreads[1], treadDepth,
+    );
+  } else if (flightTreads.length === 3) {
+    // True 3-flight U (middle leg > 2·widthPx): F1 → L1 → F2 across → L2 → F3.
+    const e1 = addFlight(0, 0, 0, 0, flightTreads[0], treadDepth);
+    const landing1Y = e1.endY;
+    const landing1CX = e1.endX + widthPx / 2;
+    // Landing 1 sits at end of Flight 1, aligned with its centerline (z=0).
+    addLanding(landing1CX, landing1Y, 0, widthPx, widthPx);
+    // Flight 2 perpendicular: starts at the side edge of landing1, runs across gap.
+    const f2StartX = landing1CX;
     const f2StartZ = turnSign * (widthPx / 2);
     const f2RotY = turnSign * (Math.PI / 2);
-    addFlight(f2StartX, landingY, f2StartZ, f2RotY, f2, treadDepth);
+    const e2 = addFlight(f2StartX, landing1Y, f2StartZ, f2RotY, flightTreads[1], treadDepth);
+    const landing2Y = e2.endY;
+    const landing2CX = e2.endX;
+    const landing2CZ = e2.endZ + turnSign * (widthPx / 2);
+    addLanding(landing2CX, landing2Y, landing2CZ, widthPx, widthPx);
+    // Flight 3 returns in -X (rotY=π) starting on the same X axis where Flight 1 ends,
+    // so it lands back at x=0 mirroring Flight 1.
+    const f3StartX = e1.endX;
+    const f3StartZ = landing2CZ;
+    addFlight(f3StartX, landing2Y, f3StartZ, Math.PI, flightTreads[2], treadDepth);
   } else {
-    const f1 = Math.ceil(nTreads / 2);
-    const f2 = nTreads - f1;
-    const treadDepth = runLength / Math.max(1, f1 + f2);
-    const e1 = addFlight(0, 0, 0, 0, f1, treadDepth);
+    // 2-flight switchback U.
+    const e1 = addFlight(0, 0, 0, 0, flightTreads[0], treadDepth);
     const landingCX = e1.endX + widthPx / 2;
     const landingCZ = turnSign * (widthPx / 2);
     const landingY = e1.endY;
     addLanding(landingCX, landingY, landingCZ, widthPx, 2 * widthPx);
-    // Flight 2 is rotated 180°, so building steps forward in its local +X
-    // draws them back toward the origin in parent space. Its origin sits at
-    // the same X axis where flight 1 ended, offset in Z by widthPx (parallel
-    // return flight on the turn side of the landing).
     const f2StartX = e1.endX;
     const f2StartZ = turnSign * widthPx;
-    addFlight(f2StartX, landingY, f2StartZ, Math.PI, f2, treadDepth);
-
+    addFlight(f2StartX, landingY, f2StartZ, Math.PI, flightTreads[1], treadDepth);
   }
 
   return { pieces };
 }
+
+export type StairMaterialGroup = {
+  material?: MaterialAssignment;
+  tileScale?: number;
+  tint?: string;
+};
 
 type StairMeshProps = {
   stair: StairsStructure3D;
@@ -1239,19 +1293,97 @@ type StairMeshProps = {
   onClick: () => void;
   isInteractive: boolean;
   tint?: string;
+  treadGroup?: StairMaterialGroup;
+  riserGroup?: StairMaterialGroup;
+  stringerGroup?: StairMaterialGroup;
 };
+
+// Renders either a TexturedSurface (if the group has a picked material) or a
+// plain colored MeshStandardMaterial. Repeat is derived from tile scale so
+// every piece within a group writes the same repeat back to the shared
+// texture cache (no per-mesh racing).
+interface StairPieceMaterialProps {
+  group?: StairMaterialGroup;
+  fallbackColor: string;
+  roughness: number;
+  metalness: number;
+  emissive?: string;
+  emissiveIntensity?: number;
+}
+function StairPieceMaterial({
+  group, fallbackColor, roughness, metalness, emissive = "#000000", emissiveIntensity = 0,
+}: StairPieceMaterialProps) {
+  const tint = group?.tint;
+  const material = group?.material;
+  const tileScale = group?.tileScale ?? 1;
+  const repeat: [number, number] = [1 / tileScale, 1 / tileScale];
+  if (material) {
+    return (
+      <Suspense
+        fallback={
+          <meshStandardMaterial
+            color={tint ?? fallbackColor}
+            roughness={roughness}
+            metalness={metalness}
+            emissive={emissive}
+            emissiveIntensity={emissiveIntensity}
+          />
+        }
+      >
+        <TexturedSurface
+          material={material}
+          repeat={repeat}
+          emissive={emissive}
+          emissiveIntensity={emissiveIntensity}
+          tint={tint}
+          hasUv2={false}
+        />
+      </Suspense>
+    );
+  }
+  return (
+    <meshStandardMaterial
+      color={tint ?? fallbackColor}
+      roughness={roughness}
+      metalness={metalness}
+      emissive={emissive}
+      emissiveIntensity={emissiveIntensity}
+    />
+  );
+}
 
 function StairMeshImpl({
   stair, ceilingPx, floorYOffset, inchToPx, selected, onClick, isInteractive, tint,
+  treadGroup, riserGroup, stringerGroup,
 }: StairMeshProps) {
-  const matRef = useRef<THREE.MeshStandardMaterial | null>(null);
-
-  const start = stair.start ?? stair.polygon[0] ?? { x: 0, y: 0 };
-  const runAngle = useMemo(
-    () => getStairInitialRunAngle(stair as StairLike),
-    // Only re-compute when the inputs to the angle actually change.
+  // Derive missing start/end from the polygon's open-end midpoints (matches
+  // the 2D editor's `getStairOpenEnds` fallback). Without this, newly-created
+  // stairs and freshly-reshaped stairs render with origin=polygon[0] — a
+  // corner — which shifts Flight #1 off the entry edge (looks like it grows
+  // from a centerline / wrong orientation) until the user hits Switch Start/End.
+  const derivedEnds = useMemo(
+    () => getStairOpenEndMids(
+      stair.polygon,
+      stair.shape ?? "straight",
+      inchToPx(stair.width_in ?? 36),
+    ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [stair.start?.x, stair.start?.y, stair.end?.x, stair.end?.y, stair.polygon],
+    [stair.polygon, stair.shape, stair.width_in, inchToPx],
+  );
+  const start = stair.start ?? derivedEnds[0] ?? stair.polygon[0] ?? { x: 0, y: 0 };
+  const derivedEnd = stair.end ?? derivedEnds[1] ?? start;
+  const stairForGeom = useMemo<StairLike>(
+    () => (stair.start && stair.end
+      ? (stair as StairLike)
+      : { ...(stair as StairLike), start, end: derivedEnd }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [stair, start.x, start.y, derivedEnd.x, derivedEnd.y],
+  );
+
+  const runAngle = useMemo(
+    () => getStairInitialRunAngle(stairForGeom),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [start.x, start.y, derivedEnd.x, derivedEnd.y, stair.polygon],
   );
 
   const flights = useMemo(() => {
@@ -1263,35 +1395,25 @@ function StairMeshImpl({
     const overhang = inchToPx(1);
     const stringerHeight = inchToPx(10);
     const stringerThickness = inchToPx(1.5);
-    const turnSign = getStairTurnSign(stair as StairLike);
+    const turnSign = getStairTurnSign(stairForGeom);
+    const preferredTreadDepth = inchToPx(10.5);
     return buildStairFlights(
-      stair, totalHeight, widthPx,
+      stairForGeom as StairsStructure3D, totalHeight, widthPx,
       treadThickness, overhang, stringerHeight, stringerThickness,
-      turnSign,
+      turnSign, preferredTreadDepth,
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     stair.id, stair.shape, stair.tread_count, stair.width_in,
-    stair.polygon, stair.start?.x, stair.start?.y, stair.end?.x, stair.end?.y,
-    ceilingPx, inchToPx,
+    stair.polygon, start.x, start.y, derivedEnd.x, derivedEnd.y,
+    ceilingPx, inchToPx, stairForGeom,
   ]);
 
-  // Selection glow — mutate shared/instance material without re-rendering.
-  useEffect(() => {
-    const m = matRef.current;
-    if (!m || !m.emissive) return;
-    if (selected) {
-      m.emissive.setHex(0xff7a18);
-      m.emissiveIntensity = 0.25;
-    } else {
-      m.emissive.setHex(0x000000);
-      m.emissiveIntensity = 0;
-    }
-    m.needsUpdate = true;
-  }, [selected]);
-
-  const color = tint ?? "#c9b89c";
-  
+  const treadFallback = tint ?? treadGroup?.tint ?? "#c9b89c";
+  const riserFallback = tint ?? riserGroup?.tint ?? "#c9b89c";
+  const stringerFallback = stringerGroup?.tint ?? "#8b7355";
+  const selEmissive = selected ? "#ff7a18" : "#000000";
+  const selEmissiveIntensity = selected ? 0.25 : 0;
 
   const rotRad = stair.rotation_rad ?? 0;
   const anchor = stair.rotation_anchor ?? start;
@@ -1312,11 +1434,14 @@ function StairMeshImpl({
               onClick={isInteractive ? (e) => { e.stopPropagation(); onClick(); } : undefined}
             >
               <boxGeometry args={[p.depth, p.thickness, p.width]} />
-              {i === 0 ? (
-                <meshStandardMaterial ref={matRef} color={color} roughness={0.6} metalness={0.05} />
-              ) : (
-                <meshStandardMaterial color={color} roughness={0.6} metalness={0.05} />
-              )}
+              <StairPieceMaterial
+                group={treadGroup}
+                fallbackColor={treadFallback}
+                roughness={0.6}
+                metalness={0.05}
+                emissive={selEmissive}
+                emissiveIntensity={selEmissiveIntensity}
+              />
             </mesh>
           );
         }
@@ -1331,7 +1456,14 @@ function StairMeshImpl({
               onClick={isInteractive ? (e) => { e.stopPropagation(); onClick(); } : undefined}
             >
               <boxGeometry args={[p.sizeX, p.thickness, p.sizeZ]} />
-              <meshStandardMaterial color={color} roughness={0.6} metalness={0.05} />
+              <StairPieceMaterial
+                group={treadGroup}
+                fallbackColor={treadFallback}
+                roughness={0.6}
+                metalness={0.05}
+                emissive={selEmissive}
+                emissiveIntensity={selEmissiveIntensity}
+              />
             </mesh>
           );
         }
@@ -1347,15 +1479,20 @@ function StairMeshImpl({
               onClick={isInteractive ? (e) => { e.stopPropagation(); onClick(); } : undefined}
             >
               <boxGeometry args={[p.thickness, p.height, p.width]} />
-              <meshStandardMaterial color={color} roughness={0.7} metalness={0.05} />
+              <StairPieceMaterial
+                group={riserGroup}
+                fallbackColor={riserFallback}
+                roughness={0.7}
+                metalness={0.05}
+                emissive={selEmissive}
+                emissiveIntensity={selEmissiveIntensity}
+              />
             </mesh>
           );
         }
         // stringer — nest rotations so the pitch (rotZ) is applied in the
-        // flight's local frame *after* the Y rotation. Applying both on a
-        // single Euler `[0, rotY, rotZ]` uses XYZ order, which for flight 2
-        // of L/U shapes (rotY = ±π/2 or π) pitches the box in the wrong frame
-        // and lifts its midpoint toward the ceiling.
+        // flight's local frame *after* the Y rotation.
+        const useSharedStringer = !stringerGroup?.material && !stringerGroup?.tint;
         return (
           <group key={i} position={[p.x, p.y, p.z]} rotation={[0, -p.rotY, 0]}>
             <group rotation={[0, 0, p.rotZ]}>
@@ -1363,9 +1500,21 @@ function StairMeshImpl({
                 castShadow
                 receiveShadow
                 raycast={isInteractive ? DEFAULT_MESH_RAYCAST : NULL_RAYCAST}
+                onClick={isInteractive ? (e) => { e.stopPropagation(); onClick(); } : undefined}
               >
                 <boxGeometry args={[p.length, p.height, p.thickness]} />
-                <primitive object={SHARED_STAIR_STRINGER_MATERIAL} attach="material" />
+                {useSharedStringer ? (
+                  <primitive object={SHARED_STAIR_STRINGER_MATERIAL} attach="material" />
+                ) : (
+                  <StairPieceMaterial
+                    group={stringerGroup}
+                    fallbackColor={stringerFallback}
+                    roughness={0.75}
+                    metalness={0.05}
+                    emissive={selEmissive}
+                    emissiveIntensity={selEmissiveIntensity}
+                  />
+                )}
               </mesh>
             </group>
           </group>
@@ -1381,6 +1530,15 @@ const StairMesh = memo(StairMeshImpl, (a, b) => {
   if (a.ceilingPx !== b.ceilingPx) return false;
   if (a.floorYOffset !== b.floorYOffset) return false;
   if (a.tint !== b.tint) return false;
+  if (a.treadGroup?.material !== b.treadGroup?.material) return false;
+  if (a.treadGroup?.tileScale !== b.treadGroup?.tileScale) return false;
+  if (a.treadGroup?.tint !== b.treadGroup?.tint) return false;
+  if (a.riserGroup?.material !== b.riserGroup?.material) return false;
+  if (a.riserGroup?.tileScale !== b.riserGroup?.tileScale) return false;
+  if (a.riserGroup?.tint !== b.riserGroup?.tint) return false;
+  if (a.stringerGroup?.material !== b.stringerGroup?.material) return false;
+  if (a.stringerGroup?.tileScale !== b.stringerGroup?.tileScale) return false;
+  if (a.stringerGroup?.tint !== b.stringerGroup?.tint) return false;
   if (a.inchToPx !== b.inchToPx) return false;
   const s1 = a.stair, s2 = b.stair;
   if (s1 === s2) return true;
@@ -1502,7 +1660,15 @@ function SceneContents({ floors, walls, doors, windows, furniture, structures, f
       )}
       {structures && structures.map((s) => {
         if (s.kind !== "stairs") return null;
-        const stair = s as StairsStructure3D;
+        const stair = s as StairsStructure3D & { __from_master_floor?: number };
+        // Only the "master" stair generates 3D geometry:
+        //  - skip the mirrored copy that's injected on the upper floor for editing
+        //  - skip a linked DN stair (its paired UP is the master)
+        if (stair.__from_master_floor) return null;
+        if (stair.direction === "DN" && stair.linked_stair_id) return null;
+        const treadMeta = visualMetadata[`stair_tread_${stair.id}`];
+        const riserMeta = visualMetadata[`stair_riser_${stair.id}`];
+        const stringerMeta = visualMetadata[`stair_stringer_${stair.id}`];
         return (
           <StairMesh
             key={stair.id}
@@ -1514,9 +1680,13 @@ function SceneContents({ floors, walls, doors, windows, furniture, structures, f
             onClick={() => onSelect({ kind: "stairs", id: stair.id })}
             isInteractive={isInteractive}
             tint={visualMetadata[stair.id]?.tint}
+            treadGroup={{ material: treadMeta?.material, tileScale: treadMeta?.tile_scale, tint: treadMeta?.tint }}
+            riserGroup={{ material: riserMeta?.material, tileScale: riserMeta?.tile_scale, tint: riserMeta?.tint }}
+            stringerGroup={{ material: stringerMeta?.material, tileScale: stringerMeta?.tile_scale, tint: stringerMeta?.tint }}
           />
         );
       })}
+
     </Bvh>
   );
 }
@@ -1528,7 +1698,45 @@ function CameraRig({ pixelsPerFoot }: { pixelsPerFoot: number }) {
   return <PerspectiveCamera makeDefault fov={45} position={[dist, dist, dist]} near={Math.max(pixelsPerFoot * 0.5, 1)} far={far} />;
 }
 
-export default function FloorPlan3D({ floorsData, visibleFloor, furnitureAssets, pixelsPerFoot, visualMetadata, selection, onSelect, ambientIntensity, directionalIntensity, windowIntensity = 4, roomLightIntensity = 0.2, nightMode = false, sunAzimuthDeg = 135, sunElevationDeg = 55, sunWarmth = 0.25, exposure = 1.0, onZoomChange }: Props) {
+/**
+ * Snaps the camera to a top-down "plan" view whenever `nonce` changes.
+ * The scene is centered around world origin (an outer <group> offsets by
+ * -sceneCenter), so we can target (0,0,0) directly.
+ */
+function PlanViewController({
+  nonce,
+  sizeX,
+  sizeZ,
+  pixelsPerFoot,
+  controlsRef,
+}: {
+  nonce: number;
+  sizeX: number;
+  sizeZ: number;
+  pixelsPerFoot: number;
+  controlsRef: React.MutableRefObject<any>;
+}) {
+  const camera = useThree((s) => s.camera);
+  const invalidate = useThree((s) => s.invalidate);
+  const first = useRef(true);
+  useEffect(() => {
+    if (first.current) { first.current = false; return; }
+    const maxSize = Math.max(sizeX, sizeZ, pixelsPerFoot * 20);
+    // fov=45deg → half-height on ground = h*tan(22.5deg) ≈ h*0.414
+    const height = (maxSize * 0.6) / 0.414;
+    camera.position.set(0, height, 0.001);
+    camera.lookAt(0, 0, 0);
+    camera.updateProjectionMatrix();
+    if (controlsRef.current) {
+      controlsRef.current.target.set(0, 0, 0);
+      controlsRef.current.update();
+    }
+    invalidate();
+  }, [nonce, sizeX, sizeZ, pixelsPerFoot, camera, invalidate, controlsRef]);
+  return null;
+}
+
+export default function FloorPlan3D({ floorsData, visibleFloor, furnitureAssets, pixelsPerFoot, visualMetadata, selection, onSelect, ambientIntensity, directionalIntensity, windowIntensity = 4, roomLightIntensity = 0.2, nightMode = false, sunAzimuthDeg = 135, sunElevationDeg = 55, sunWarmth = 0.25, exposure = 1.0, onZoomChange, topDownNonce = 0 }: Props) {
   const allModelUrls = useMemo(() => {
     const urls: (string | undefined)[] = [];
     for (const fd of floorsData) {
@@ -1558,8 +1766,8 @@ export default function FloorPlan3D({ floorsData, visibleFloor, furnitureAssets,
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [floorsData, pixelsPerFoot]);
 
-  // Shared XY scene center across all floors (so alignment holds).
-  const sceneCenter = useMemo(() => {
+  // Shared XY scene center + XY size across all floors (so alignment holds).
+  const sceneBox = useMemo(() => {
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const fd of floorsData) {
       for (const f of fd.floors) for (const p of f.polygon) {
@@ -1571,9 +1779,10 @@ export default function FloorPlan3D({ floorsData, visibleFloor, furnitureAssets,
         if (p.x > maxX) maxX = p.x; if (p.y > maxY) maxY = p.y;
       }
     }
-    if (!isFinite(minX)) return { x: 0, y: 0 };
-    return { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+    if (!isFinite(minX)) return { x: 0, y: 0, sizeX: 0, sizeZ: 0 };
+    return { x: (minX + maxX) / 2, y: (minY + maxY) / 2, sizeX: maxX - minX, sizeZ: maxY - minY };
   }, [floorsData]);
+  const sceneCenter = sceneBox;
 
   // Aggregate arrays for LightingSystem so the sun bounds and window
   // portals cover the whole stack.
@@ -1603,7 +1812,22 @@ export default function FloorPlan3D({ floorsData, visibleFloor, furnitureAssets,
       gl={{ antialias: true, toneMapping: THREE.ACESFilmicToneMapping, toneMappingExposure: exposure }}
       style={{ width: "100%", height: "100%" }}
     >
+      <SkyBackground />
+      <Grid
+        infiniteGrid
+        fadeDistance={pixelsPerFoot * 200}
+        fadeStrength={1.5}
+        sectionColor="#e1cbcb"
+        cellColor="#e2e8f0"
+        cellSize={pixelsPerFoot}
+        sectionSize={pixelsPerFoot * 5}
+        cellThickness={0.6}
+        sectionThickness={1}
+        position={[0, -2, 0]}
+        raycast={NULL_RAYCAST}
+      />
       <CameraRig pixelsPerFoot={pixelsPerFoot} />
+      <PlanViewController nonce={topDownNonce} sizeX={sceneBox.sizeX} sizeZ={sceneBox.sizeZ} pixelsPerFoot={pixelsPerFoot} controlsRef={controlsRef} />
       <InvalidateOnChange deps={[floorsData, visibleFloor, visualMetadata, selection, pixelsPerFoot, ambientIntensity, directionalIntensity, windowIntensity, roomLightIntensity, nightMode, sunAzimuthDeg, sunElevationDeg, sunWarmth, exposure]} />
       <OrbitControls
         ref={controlsRef}
@@ -1690,7 +1914,7 @@ export default function FloorPlan3D({ floorsData, visibleFloor, furnitureAssets,
         </Suspense>
       </group>
       <Suspense fallback={null}>
-        <Environment files="/environments/noon_grass_1k.hdr" background environmentIntensity={0.3} />
+        <Environment files="/environments/noon_grass_1k.hdr" background={false} environmentIntensity={0.3} />
       </Suspense>
       <EffectComposer multisampling={4} enableNormalPass>
         <N8AO aoRadius={pixelsPerFoot * 1} intensity={1.5} distanceFalloff={3} quality="low" />
