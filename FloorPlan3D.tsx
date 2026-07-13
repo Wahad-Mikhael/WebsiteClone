@@ -1,5 +1,5 @@
-import { memo, useMemo, useRef, useLayoutEffect, useCallback, Suspense, useEffect } from "react";
-import { Canvas, useThree, type ThreeEvent } from "@react-three/fiber";
+import { memo, useMemo, useRef, useLayoutEffect, useCallback, Suspense, useEffect, useState } from "react";
+import { Canvas, useThree, useFrame, type ThreeEvent } from "@react-three/fiber";
 import { OrbitControls, PerspectiveCamera, Environment, useTexture, Bvh, Grid } from "@react-three/drei";
 import { EffectComposer, N8AO } from "@react-three/postprocessing";
 import * as THREE from "three";
@@ -8,7 +8,11 @@ import { DoorInstance, WindowInstance, useModelPreload } from "./ModelSystem";
 import { Furniture3D } from "./Furniture3D";
 import type { AssetModel } from "@/lib/assets";
 import { SHARED_MATERIALS, SHARED_HOVER_MATERIALS, SHARED_STAIR_STRINGER_MATERIAL } from "@/lib/sharedMaterials";
-import { getStairInitialRunAngle, getStairTurnSign, getStairLegLengthsPx, getStairOpenEndMids, type StairLike } from "@/lib/stairLogic";
+import { getStairInitialRunAngle, getStairTurnSign, getStairLegLengthsPx, getStairOpenEndMids, computeStairHeadroomCutouts, type StairLike } from "@/lib/stairLogic";
+import polygonClipping from "polygon-clipping";
+
+// Minimum headroom clearance between stair tread and slab above (IRC ≥ 80").
+const STAIR_HEADROOM_IN = 80;
 
 export type Pt = { x: number; y: number };
 export type Floor = { id: string; polygon: Pt[] };
@@ -70,7 +74,11 @@ export type Selection3D =
   | { kind: "baseboard"; id: string }
   | { kind: "furniture"; id: string }
   | { kind: "stairs"; id: string }
+  | { kind: "ceiling"; id: string }
   | null;
+
+export type WalkPose = { x: number; z: number; yaw: number; floorIndex: 1 | 2; visited?: boolean };
+export type WalkPoseRef = { current: WalkPose };
 
 export type StairsStructure3D = {
   id: string;
@@ -121,7 +129,46 @@ interface Props {
   onZoomChange?: (zoom: number) => void;
   /** Bump this number to snap the camera to a top-down plan view. */
   topDownNonce?: number;
+  /** When "walk", enables first-person WASD/pointer-lock controller. */
+  mode?: "orbit" | "walk";
+  /** Called (debounced) when the walker crosses to a new floor via Y-hit. */
+  onWalkFloorChange?: (floor: 1 | 2) => void;
+  /** Live camera pose written each frame by the walk controller. */
+  walkPoseRef?: WalkPoseRef;
+  /** Imperative teleport request. Editor bumps `nonce`; controller polls
+   *  every frame and applies (x, z) in floor-plan coords. */
+  walkTeleportRef?: React.MutableRefObject<{ x: number; z: number; nonce: number }>;
+  /** Editor writes an invalidate() callback here on walk-mode mount so
+   *  imperative updates (minimap drag, height slider) can wake the demand
+   *  render loop from outside the Canvas. */
+  walkInvalidateRef?: React.MutableRefObject<(() => void) | null>;
+  /** Eye height in inches (default 70 = 5'-10"). */
+  personHeightInches?: number;
+  /** Imperative renderer capture API (populated by an in-Canvas bridge). */
+  renderCaptureRef?: React.MutableRefObject<RenderCaptureAPI | null>;
 }
+
+export type StudioSession = {
+  /** Begin the render. Progress fires with rounded sample count. Resolves when render begins (not when it completes). */
+  start(targetSamples: number, onProgress: (samples: number) => void, onFrame: (canvasSource: HTMLCanvasElement) => void, onDone: () => void, onError: (err: unknown) => void): Promise<void>;
+  /** Stop the loop and run cleanup. Safe to call multiple times. */
+  cancel(): void;
+  /** Snapshot current tracer output as PNG data URL. */
+  save(): string | null;
+};
+
+export type RenderCaptureAPI = {
+  /** Returns a JPEG data URL of the current on-screen view. */
+  capturePreview(quality?: number): string | null;
+  /** Off-size render to (w, h) → PNG data URL. Restores canvas immediately. */
+  executeRender(width: number, height: number): string | null;
+  /** Current on-screen size in device pixels (w, h). */
+  getScreenSize(): { width: number; height: number };
+  /** Begin a Studio (path traced) render session at (w, h). */
+  startStudio(width: number, height: number): StudioSession;
+};
+
+
 
 
 const DEFAULT_WALL_COLOR = "#e8e3dc";
@@ -223,25 +270,29 @@ function buildWallGeometry(
   thicknessPx: number,
   holes: Array<{ x: number; y: number; w: number; h: number; arch?: boolean }>,
 ) {
+  // Extend the outer shape a few pixels BELOW y=0 so any door/arch hole that
+  // overshoots the wall's bottom edge stays strictly interior to the outer
+  // contour. Earcut aborts hole triangulation when a hole vertex sits exactly
+  // on the outer boundary — that is what left the coplanar sliver at y=0.
+  // The extra material below y=0 is hidden beneath the floor slab.
+  const padBottom = 2;
   const shape = new THREE.Shape();
-  shape.moveTo(0, 0);
-  shape.lineTo(lengthPx, 0);
+  shape.moveTo(0, -padBottom);
+  shape.lineTo(lengthPx, -padBottom);
   shape.lineTo(lengthPx, heightPx);
   shape.lineTo(0, heightPx);
-  shape.lineTo(0, 0);
+  shape.lineTo(0, -padBottom);
 
+  const yMin = -padBottom + 0.5;
+  const yMax = heightPx - 0.5;
   for (const h of holes) {
     const hole = new THREE.Path();
-    const x0 = Math.max(0, Math.min(lengthPx, h.x));
-    const x1 = Math.max(0, Math.min(lengthPx, h.x + h.w));
-    const y0 = Math.max(0, Math.min(heightPx, h.y));
-    const y1 = Math.max(0, Math.min(heightPx, h.y + h.h));
+    const x0 = Math.max(0.5, Math.min(lengthPx - 0.5, h.x));
+    const x1 = Math.max(0.5, Math.min(lengthPx - 0.5, h.x + h.w));
+    const y0 = Math.max(yMin, Math.min(yMax, h.y));
+    const y1 = Math.max(yMin, Math.min(yMax, h.y + h.h));
     if (x1 - x0 < 0.5 || y1 - y0 < 0.5) continue;
     if (h.arch) {
-      // Arched opening: top is a semicircle whose radius equals half the
-      // opening width. The tip of the semicircle sits exactly at y1, so the
-      // arc center is (cx, y1 - R) and the straight sides run from y0 up to
-      // y1 - R. Winding matches the rectangular hole (CCW).
       const wHole = x1 - x0;
       const R = Math.max(0.5, wHole / 2);
       const cx = (x0 + x1) / 2;
@@ -454,8 +505,9 @@ interface FloorMeshProps {
   yOffset: number;
   tint?: string;
   isInteractive: boolean;
+  stairHolePolygons?: Pt[][];
 }
-function FloorMeshImpl({ floor, color, material, tileScale, pixelsPerFoot, selected, onClick, yOffset, tint, isInteractive }: FloorMeshProps) {
+function FloorMeshImpl({ floor, color, material, tileScale, pixelsPerFoot, selected, onClick, yOffset, tint, isInteractive, stairHolePolygons }: FloorMeshProps) {
   const geom = useDisposableGeometry(useMemo(() => {
     if (floor.polygon.length < 3) return null;
     const shape = new THREE.Shape();
@@ -464,11 +516,21 @@ function FloorMeshImpl({ floor, color, material, tileScale, pixelsPerFoot, selec
       shape.lineTo(floor.polygon[i].x, floor.polygon[i].y);
     }
     shape.closePath();
+    if (stairHolePolygons && stairHolePolygons.length > 0) {
+      for (const holePoly of stairHolePolygons) {
+        if (!holePoly || holePoly.length < 3) continue;
+        const path = new THREE.Path();
+        path.moveTo(holePoly[0].x, holePoly[0].y);
+        for (let i = 1; i < holePoly.length; i++) path.lineTo(holePoly[i].x, holePoly[i].y);
+        path.closePath();
+        shape.holes.push(path);
+      }
+    }
     const g = new THREE.ShapeGeometry(shape);
     const uv = g.attributes.uv;
     if (uv) g.setAttribute("uv2", new THREE.BufferAttribute(uv.array.slice(), 2));
     return g;
-  }, [floor.polygon]));
+  }, [floor.polygon, stairHolePolygons]));
 
   const { repeat, offset } = useMemo(() => {
     let minX = Infinity, minY = Infinity;
@@ -560,6 +622,7 @@ const FloorMesh = memo(FloorMeshImpl, (a, b) => {
   if (a.yOffset !== b.yOffset) return false;
   if (a.tint !== b.tint) return false;
   if (a.isInteractive !== b.isInteractive) return false;
+  if (a.stairHolePolygons !== b.stairHolePolygons) return false;
   if (a.floor === b.floor) return true;
   if (a.floor.id !== b.floor.id) return false;
   const pa = a.floor.polygon, pb = b.floor.polygon;
@@ -684,11 +747,15 @@ function WallMeshImpl({ wall, ceilingPx, inchToPx, doors, windows, color, materi
 
   const geom = useDisposableGeometry(useMemo(() => {
     const holes: Array<{ x: number; y: number; w: number; h: number; arch?: boolean }> = [];
+    // Epsilon overshoot: extend door/arch cutouts below Y=0 so the subtraction
+    // fully breaches the wall's bottom edge instead of leaving a coplanar sliver
+    // that Z-fights with the floor.
+    const epsilon = 1;
     for (const d of doors) {
       const center = { x: (d.hinge.x + d.strike.x) / 2, y: (d.hinge.y + d.strike.y) / 2 };
       const { along } = projectOntoWall(center, wall);
       const heightPx = inchToPx(d.height_in ?? 80);
-      holes.push({ x: along - d.width / 2, y: 0, w: d.width, h: heightPx, arch: !!d.is_arch });
+      holes.push({ x: along - d.width / 2, y: -epsilon, w: d.width, h: heightPx + epsilon, arch: !!d.is_arch });
     }
     for (const win of windows) {
       const { along } = projectOntoWall(win.center, wall);
@@ -1067,16 +1134,61 @@ const OpeningPlaceholder = memo(OpeningPlaceholderImpl, (a, b) =>
   a.isInteractive === b.isInteractive,
 );
 
-function CeilingMeshImpl({ polygon, yPx }: { polygon: Pt[]; yPx: number }) {
+function CeilingMeshImpl({ polygon, yPx, stairHolePolygons, walkMode, selected, tint, material, tileScale, pixelsPerFoot, onClick }: { polygon: Pt[]; yPx: number; stairHolePolygons?: Pt[][]; walkMode?: boolean; selected?: boolean; tint?: string; material?: MaterialAssignment; tileScale?: number; pixelsPerFoot?: number; onClick?: () => void }) {
   const geom = useDisposableGeometry(useMemo(() => {
     if (!polygon || polygon.length < 3) return null;
     const shape = new THREE.Shape();
     shape.moveTo(polygon[0].x, polygon[0].y);
     for (let i = 1; i < polygon.length; i++) shape.lineTo(polygon[i].x, polygon[i].y);
     shape.closePath();
+    if (stairHolePolygons && stairHolePolygons.length > 0) {
+      for (const holePoly of stairHolePolygons) {
+        if (!holePoly || holePoly.length < 3) continue;
+        const path = new THREE.Path();
+        path.moveTo(holePoly[0].x, holePoly[0].y);
+        for (let i = 1; i < holePoly.length; i++) path.lineTo(holePoly[i].x, holePoly[i].y);
+        path.closePath();
+        shape.holes.push(path);
+      }
+    }
     return new THREE.ShapeGeometry(shape);
-  }, [polygon]));
+  }, [polygon, stairHolePolygons]));
+
+  // Per-instance opaque material for walk mode / tinted / selected ceilings.
+  // Untinted, non-walk, no-material ceilings continue to point at the shared invisible one.
+  const useTextured = !!(walkMode && material?.color_url);
+  const walkMat = useMemo(() => {
+    if (useTextured) return null;
+    if (!walkMode && !tint && !selected) return null;
+    const m = new THREE.MeshStandardMaterial({
+      color: tint ?? "#f5f2ee",
+      roughness: 0.9,
+      metalness: 0.02,
+      side: THREE.DoubleSide,
+      transparent: !walkMode,
+      opacity: walkMode ? 1 : 0.2,
+      depthWrite: !!walkMode,
+    });
+    if (selected) {
+      m.emissive.setHex(0xff7a18);
+      m.emissiveIntensity = 0.18;
+    }
+    return m;
+  }, [walkMode, tint, selected, useTextured]);
+  useEffect(() => () => { walkMat?.dispose(); }, [walkMat]);
+
   if (!geom) return null;
+  const interactive = !!walkMode || !!onClick;
+  const ppf = pixelsPerFoot ?? 20;
+  const ts = tileScale ?? 1;
+  // Rough polygon extent for tile repeat.
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of polygon) { if (p.x < minX) minX = p.x; if (p.y < minY) minY = p.y; if (p.x > maxX) maxX = p.x; if (p.y > maxY) maxY = p.y; }
+  const w = Math.max(1, maxX - minX);
+  const h = Math.max(1, maxY - minY);
+  const repeat: [number, number] = [Math.max(0.05, w / (ppf * 4 * ts)), Math.max(0.05, h / (ppf * 4 * ts))];
+  const selEmissive = selected ? "#ff7a18" : "#000000";
+  const selEmissiveIntensity = selected ? 0.18 : 0;
   return (
     <mesh
       geometry={geom}
@@ -1084,13 +1196,20 @@ function CeilingMeshImpl({ polygon, yPx }: { polygon: Pt[]; yPx: number }) {
       position={[0, yPx, 0]}
       castShadow
       receiveShadow
-      raycast={() => null}
+      raycast={interactive ? DEFAULT_MESH_RAYCAST : NULL_RAYCAST}
+      onClick={onClick ? (e) => { e.stopPropagation(); onClick(); } : undefined}
     >
-      <primitive object={SHARED_MATERIALS.ceiling} attach="material" />
+      {useTextured ? (
+        <TexturedSurface material={material} repeat={repeat} emissive={selEmissive} emissiveIntensity={selEmissiveIntensity} hasUv2 tint={tint} />
+      ) : walkMat ? <primitive object={walkMat} attach="material" /> : <primitive object={SHARED_MATERIALS.ceiling} attach="material" />}
     </mesh>
   );
 }
-const CeilingMesh = memo(CeilingMeshImpl, (a, b) => a.polygon === b.polygon && a.yPx === b.yPx);
+const CeilingMesh = memo(CeilingMeshImpl, (a, b) =>
+  a.polygon === b.polygon && a.yPx === b.yPx && a.stairHolePolygons === b.stairHolePolygons &&
+  a.walkMode === b.walkMode && a.selected === b.selected && a.tint === b.tint &&
+  a.material === b.material && a.tileScale === b.tileScale && a.pixelsPerFoot === b.pixelsPerFoot,
+);
 
 // ============================================================================
 // StairMesh — procedural 3D staircase generator
@@ -1572,13 +1691,65 @@ type SceneContentsProps = {
   selection: Selection3D;
   onSelect: (s: Selection3D) => void;
   isInteractive: boolean;
+  /** Stairs on the floor BELOW this one (their tops punch into this floor's slab). */
+  lowerStairs?: StairsStructure3D[];
+  /** Floor-to-ceiling height (px) of the floor BELOW — used to compute rise. */
+  lowerCeilingPx?: number;
+  walkMode?: boolean;
 };
-function SceneContents({ floors, walls, doors, windows, furniture, structures, furnitureAssets, ceilingHeightIn, pixelsPerFoot, visualMetadata, selection, onSelect, isInteractive }: SceneContentsProps) {
+function SceneContents({ floors, walls, doors, windows, furniture, structures, furnitureAssets, ceilingHeightIn, pixelsPerFoot, visualMetadata, selection, onSelect, isInteractive, lowerStairs, lowerCeilingPx, walkMode }: SceneContentsProps) {
   // Stable inchToPx across renders so memoized children don't invalidate.
   const inchToPx = useCallback((n: number) => (n / 12) * pixelsPerFoot, [pixelsPerFoot]);
   const ceilingPx = inchToPx(ceilingHeightIn);
 
   const wallAdjustments = useMemo(() => computeWallAdjustments(walls), [walls]);
+
+  // Headroom cutout polygons for this floor's SLAB (from stairs on floor below).
+  const floorHolePolygons = useMemo<Pt[][]>(() => {
+    if (!lowerStairs || lowerStairs.length === 0 || !lowerCeilingPx) return [];
+    const headroomPx = inchToPx(STAIR_HEADROOM_IN);
+    const preferredTreadDepthPx = inchToPx(10.5);
+    const out: Pt[][] = [];
+    for (const s of lowerStairs) {
+      const widthPx = inchToPx(s.width_in ?? 36);
+      const rects = computeStairHeadroomCutouts(
+        s as StairLike,
+        lowerCeilingPx,
+        widthPx,
+        headroomPx,
+        preferredTreadDepthPx,
+      );
+      for (const r of rects) out.push(r);
+    }
+    return out;
+  }, [lowerStairs, lowerCeilingPx, inchToPx]);
+
+  // Same cutouts for the CEILING that sits atop THIS floor (it caps the stair
+  // rising from this floor to the one above). Uses this floor's own stairs.
+  const ceilingHolePolygons = useMemo<Pt[][]>(() => {
+    if (!structures || structures.length === 0) return [];
+    const ownStairs = structures.filter(
+      (s) => s.kind === "stairs"
+        && !(s as StairsStructure3D & { __from_master_floor?: number }).__from_master_floor
+        && !((s as StairsStructure3D).direction === "DN" && (s as StairsStructure3D).linked_stair_id),
+    ) as StairsStructure3D[];
+    if (ownStairs.length === 0) return [];
+    const headroomPx = inchToPx(STAIR_HEADROOM_IN);
+    const preferredTreadDepthPx = inchToPx(10.5);
+    const out: Pt[][] = [];
+    for (const s of ownStairs) {
+      const widthPx = inchToPx(s.width_in ?? 36);
+      const rects = computeStairHeadroomCutouts(
+        s as StairLike,
+        ceilingPx,
+        widthPx,
+        headroomPx,
+        preferredTreadDepthPx,
+      );
+      for (const r of rects) out.push(r);
+    }
+    return out;
+  }, [structures, ceilingPx, inchToPx]);
 
   const openingsByWall = useMemo(() => {
     const map: Record<string, { doors: Door[]; windows: WindowItem[] }> = {};
@@ -1595,20 +1766,90 @@ function SceneContents({ floors, walls, doors, windows, furniture, structures, f
     return map;
   }, [walls, doors, windows]);
 
+  // Point-in-polygon (ray casting). Filters holes to only the floor polygon that contains them,
+  // preventing earcut stretching artifacts when a hole would spill outside an unrelated floor slab.
+  const pointInPoly = useCallback((pt: Pt, poly: Pt[]): boolean => {
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const xi = poly[i].x, yi = poly[i].y;
+      const xj = poly[j].x, yj = poly[j].y;
+      const intersect = ((yi > pt.y) !== (yj > pt.y)) && (pt.x < ((xj - xi) * (pt.y - yi)) / (yj - yi + 1e-12) + xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }, []);
+  const holesForPolygon = useCallback((holes: Pt[][], poly: Pt[]): Pt[][] => {
+    if (holes.length === 0 || poly.length < 3) return [];
+    // Host detection: only assign a hole to this polygon if its centroid
+    // falls inside. Then 2D-boolean intersect the hole against the host so
+    // the resulting cutout is strictly contained (Earcut requires holes to
+    // lie fully inside the outer shape — any overhang crashes triangulation
+    // and the whole slab disappears).
+    const hostRing: [number, number][] = poly.map((p) => [p.x, p.y]);
+    if (hostRing.length > 0 && (hostRing[0][0] !== hostRing[hostRing.length - 1][0] || hostRing[0][1] !== hostRing[hostRing.length - 1][1])) {
+      hostRing.push([hostRing[0][0], hostRing[0][1]]);
+    }
+    const out: Pt[][] = [];
+    for (const h of holes) {
+      if (h.length < 3) continue;
+      let cx = 0, cy = 0;
+      for (const v of h) { cx += v.x; cy += v.y; }
+      cx /= h.length; cy /= h.length;
+      if (!pointInPoly({ x: cx, y: cy }, poly)) continue;
+      const holeRing: [number, number][] = h.map((p) => [p.x, p.y]);
+      if (holeRing[0][0] !== holeRing[holeRing.length - 1][0] || holeRing[0][1] !== holeRing[holeRing.length - 1][1]) {
+        holeRing.push([holeRing[0][0], holeRing[0][1]]);
+      }
+      try {
+        const clipped = polygonClipping.intersection([hostRing], [holeRing]);
+        if (!clipped || clipped.length === 0) continue;
+        for (const multi of clipped) {
+          const outer = multi[0];
+          if (!outer || outer.length < 4) continue;
+          const ring = outer.slice(0, outer.length - 1).map(([x, y]: [number, number]) => ({ x, y }));
+          if (ring.length >= 3) out.push(ring);
+        }
+      } catch {
+        // Boolean failed on degenerate geometry — skip rather than crash slab.
+      }
+    }
+    return out;
+  }, [pointInPoly]);
+
   return (
     <Bvh firstHitOnly>
-      {floors.map((f: Floor, i: number) => (
-        <FloorMesh key={f.id} floor={f} color={visualMetadata[f.id]?.color ?? DEFAULT_FLOOR_COLOR} material={visualMetadata[f.id]?.material} tileScale={visualMetadata[f.id]?.tile_scale ?? 1} pixelsPerFoot={pixelsPerFoot} selected={selection?.kind === "floor" && selection.id === f.id} onClick={() => onSelect({ kind: "floor", id: f.id })} yOffset={i === 0 ? -0.5 : 0} tint={visualMetadata[f.id]?.tint} isInteractive={isInteractive} />
-      ))}
-      {floors.map((f: Floor) => (
-        <CeilingMesh key={`ceil_${f.id}`} polygon={f.polygon} yPx={ceilingPx} />
-      ))}
-      {walls.map((w: Wall) => {
-        const grouped = openingsByWall[w.id] ?? { doors: [], windows: [] };
+      <group userData={{ walkGround: true }}>
+        {floors.map((f: Floor, i: number) => (
+          <FloorMesh key={f.id} floor={f} color={visualMetadata[f.id]?.color ?? DEFAULT_FLOOR_COLOR} material={visualMetadata[f.id]?.material} tileScale={visualMetadata[f.id]?.tile_scale ?? 1} pixelsPerFoot={pixelsPerFoot} selected={selection?.kind === "floor" && selection.id === f.id} onClick={() => onSelect({ kind: "floor", id: f.id })} yOffset={i === 0 ? -0.5 : 0} tint={visualMetadata[f.id]?.tint} isInteractive={isInteractive} stairHolePolygons={holesForPolygon(floorHolePolygons, f.polygon)} />
+        ))}
+      </group>
+      {floors.map((f: Floor) => {
+        const cid = `ceiling_${f.id}`;
+        const cmeta = visualMetadata[cid];
         return (
-          <WallMesh key={w.id} wall={w} ceilingPx={ceilingPx} inchToPx={inchToPx} doors={grouped.doors} windows={grouped.windows} color={visualMetadata[w.id]?.color ?? DEFAULT_WALL_COLOR} material={visualMetadata[w.id]?.material} tileScale={visualMetadata[w.id]?.tile_scale ?? 1} pixelsPerFoot={pixelsPerFoot} selected={selection?.kind === "wall" && selection.id === w.id} onClick={() => onSelect({ kind: "wall", id: w.id })} adjustments={wallAdjustments[w.id] ?? { start: { front: 0, back: 0 }, end: { front: Math.hypot(w.p2.x - w.p1.x, w.p2.y - w.p1.y), back: Math.hypot(w.p2.x - w.p1.x, w.p2.y - w.p1.y) } }} baseboardSelected={selection?.kind === "baseboard" && selection.id === w.id} onSelectBaseboard={() => onSelect({ kind: "baseboard", id: w.id })} tint={visualMetadata[w.id]?.tint} baseboardMaterial={visualMetadata[`baseboard_${w.id}`]?.material} baseboardTint={visualMetadata[`baseboard_${w.id}`]?.tint} baseboardColor={visualMetadata[`baseboard_${w.id}`]?.color} baseboardTileScale={visualMetadata[`baseboard_${w.id}`]?.tile_scale ?? 1} isInteractive={isInteractive} />
+          <CeilingMesh
+            key={`ceil_${f.id}`}
+            polygon={f.polygon}
+            yPx={ceilingPx}
+            stairHolePolygons={holesForPolygon(ceilingHolePolygons, f.polygon)}
+            walkMode={walkMode}
+            selected={selection?.kind === "ceiling" && selection.id === f.id}
+            tint={cmeta?.tint ?? cmeta?.color}
+            material={cmeta?.material}
+            tileScale={cmeta?.tile_scale ?? 1}
+            pixelsPerFoot={pixelsPerFoot}
+            onClick={walkMode && isInteractive ? () => onSelect({ kind: "ceiling", id: f.id }) : undefined}
+          />
         );
       })}
+      <group userData={{ walkWall: true }}>
+        {walls.map((w: Wall) => {
+          const grouped = openingsByWall[w.id] ?? { doors: [], windows: [] };
+          return (
+            <WallMesh key={w.id} wall={w} ceilingPx={ceilingPx} inchToPx={inchToPx} doors={grouped.doors} windows={grouped.windows} color={visualMetadata[w.id]?.color ?? DEFAULT_WALL_COLOR} material={visualMetadata[w.id]?.material} tileScale={visualMetadata[w.id]?.tile_scale ?? 1} pixelsPerFoot={pixelsPerFoot} selected={selection?.kind === "wall" && selection.id === w.id} onClick={() => onSelect({ kind: "wall", id: w.id })} adjustments={wallAdjustments[w.id] ?? { start: { front: 0, back: 0 }, end: { front: Math.hypot(w.p2.x - w.p1.x, w.p2.y - w.p1.y), back: Math.hypot(w.p2.x - w.p1.x, w.p2.y - w.p1.y) } }} baseboardSelected={selection?.kind === "baseboard" && selection.id === w.id} onSelectBaseboard={() => onSelect({ kind: "baseboard", id: w.id })} tint={visualMetadata[w.id]?.tint} baseboardMaterial={visualMetadata[`baseboard_${w.id}`]?.material} baseboardTint={visualMetadata[`baseboard_${w.id}`]?.tint} baseboardColor={visualMetadata[`baseboard_${w.id}`]?.color} baseboardTileScale={visualMetadata[`baseboard_${w.id}`]?.tile_scale ?? 1} isInteractive={isInteractive} />
+          );
+        })}
+      </group>
       {doors.map((d: Door) => {
         if (d.is_arch) return null;
         const doorForModel: Door = d.is_double
@@ -1658,34 +1899,33 @@ function SceneContents({ floors, walls, doors, windows, furniture, structures, f
           isInteractive={isInteractive}
         />
       )}
-      {structures && structures.map((s) => {
-        if (s.kind !== "stairs") return null;
-        const stair = s as StairsStructure3D & { __from_master_floor?: number };
-        // Only the "master" stair generates 3D geometry:
-        //  - skip the mirrored copy that's injected on the upper floor for editing
-        //  - skip a linked DN stair (its paired UP is the master)
-        if (stair.__from_master_floor) return null;
-        if (stair.direction === "DN" && stair.linked_stair_id) return null;
-        const treadMeta = visualMetadata[`stair_tread_${stair.id}`];
-        const riserMeta = visualMetadata[`stair_riser_${stair.id}`];
-        const stringerMeta = visualMetadata[`stair_stringer_${stair.id}`];
-        return (
-          <StairMesh
-            key={stair.id}
-            stair={stair}
-            ceilingPx={ceilingPx}
-            floorYOffset={0}
-            inchToPx={inchToPx}
-            selected={selection?.kind === "stairs" && selection.id === stair.id}
-            onClick={() => onSelect({ kind: "stairs", id: stair.id })}
-            isInteractive={isInteractive}
-            tint={visualMetadata[stair.id]?.tint}
-            treadGroup={{ material: treadMeta?.material, tileScale: treadMeta?.tile_scale, tint: treadMeta?.tint }}
-            riserGroup={{ material: riserMeta?.material, tileScale: riserMeta?.tile_scale, tint: riserMeta?.tint }}
-            stringerGroup={{ material: stringerMeta?.material, tileScale: stringerMeta?.tile_scale, tint: stringerMeta?.tint }}
-          />
-        );
-      })}
+      <group userData={{ walkGround: true }}>
+        {structures && structures.map((s) => {
+          if (s.kind !== "stairs") return null;
+          const stair = s as StairsStructure3D & { __from_master_floor?: number };
+          if (stair.__from_master_floor) return null;
+          if (stair.direction === "DN" && stair.linked_stair_id) return null;
+          const treadMeta = visualMetadata[`stair_tread_${stair.id}`];
+          const riserMeta = visualMetadata[`stair_riser_${stair.id}`];
+          const stringerMeta = visualMetadata[`stair_stringer_${stair.id}`];
+          return (
+            <StairMesh
+              key={stair.id}
+              stair={stair}
+              ceilingPx={ceilingPx}
+              floorYOffset={0}
+              inchToPx={inchToPx}
+              selected={selection?.kind === "stairs" && selection.id === stair.id}
+              onClick={() => onSelect({ kind: "stairs", id: stair.id })}
+              isInteractive={isInteractive}
+              tint={visualMetadata[stair.id]?.tint}
+              treadGroup={{ material: treadMeta?.material, tileScale: treadMeta?.tile_scale, tint: treadMeta?.tint }}
+              riserGroup={{ material: riserMeta?.material, tileScale: riserMeta?.tile_scale, tint: riserMeta?.tint }}
+              stringerGroup={{ material: stringerMeta?.material, tileScale: stringerMeta?.tile_scale, tint: stringerMeta?.tint }}
+            />
+          );
+        })}
+      </group>
 
     </Bvh>
   );
@@ -1736,7 +1976,7 @@ function PlanViewController({
   return null;
 }
 
-export default function FloorPlan3D({ floorsData, visibleFloor, furnitureAssets, pixelsPerFoot, visualMetadata, selection, onSelect, ambientIntensity, directionalIntensity, windowIntensity = 4, roomLightIntensity = 0.2, nightMode = false, sunAzimuthDeg = 135, sunElevationDeg = 55, sunWarmth = 0.25, exposure = 1.0, onZoomChange, topDownNonce = 0 }: Props) {
+export default function FloorPlan3D({ floorsData, visibleFloor, furnitureAssets, pixelsPerFoot, visualMetadata, selection, onSelect, ambientIntensity, directionalIntensity, windowIntensity = 4, roomLightIntensity = 0.2, nightMode = false, sunAzimuthDeg = 135, sunElevationDeg = 55, sunWarmth = 0.25, exposure = 1.0, onZoomChange, topDownNonce = 0, mode = "orbit", onWalkFloorChange, walkPoseRef, walkTeleportRef, walkInvalidateRef, personHeightInches = 70, renderCaptureRef }: Props) {
   const allModelUrls = useMemo(() => {
     const urls: (string | undefined)[] = [];
     for (const fd of floorsData) {
@@ -1802,14 +2042,41 @@ export default function FloorPlan3D({ floorsData, visibleFloor, furnitureAssets,
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [floorsData, pixelsPerFoot, stackY]);
 
+  // Suppress selection when the pointer was dragged (orbit / camera swing).
+  // r3f fires onClick on pointerup, so we can't tell drag vs click from
+  // inside the mesh handler alone. Track pointerdown coords on the Canvas
+  // DOM; if the pointer moved more than DRAG_PX before release, ignore the
+  // resulting selection for that gesture.
+  const pointerDownRef = useRef<{ x: number; y: number; dragged: boolean } | null>(null);
+  const suppressSelectRef = useRef(false);
+  const DRAG_PX = 5;
+  const guardedOnSelect = useCallback((s: Selection3D) => {
+    if (suppressSelectRef.current) return;
+    onSelect(s);
+  }, [onSelect]);
+
   return (
     <Canvas
       frameloop="demand"
       shadows={{ type: THREE.PCFSoftShadowMap }}
-      onPointerMissed={() => onSelect(null)}
+      onPointerDown={(e) => {
+        pointerDownRef.current = { x: e.clientX, y: e.clientY, dragged: false };
+        suppressSelectRef.current = false;
+      }}
+      onPointerMove={(e) => {
+        const d = pointerDownRef.current;
+        if (!d || d.dragged) return;
+        if (Math.hypot(e.clientX - d.x, e.clientY - d.y) > DRAG_PX) d.dragged = true;
+      }}
+      onPointerUp={() => {
+        const d = pointerDownRef.current;
+        suppressSelectRef.current = !!(d && d.dragged);
+        pointerDownRef.current = null;
+      }}
+      onPointerMissed={() => { if (!suppressSelectRef.current) onSelect(null); }}
       onContextMenu={(e) => e.preventDefault()}
-      dpr={[1, 2]}
-      gl={{ antialias: true, toneMapping: THREE.ACESFilmicToneMapping, toneMappingExposure: exposure }}
+      dpr={mode === "walk" ? 1 : [1, 2]}
+      gl={{ antialias: true, toneMapping: THREE.ACESFilmicToneMapping, toneMappingExposure: exposure, preserveDrawingBuffer: true }}
       style={{ width: "100%", height: "100%" }}
     >
       <SkyBackground />
@@ -1828,7 +2095,8 @@ export default function FloorPlan3D({ floorsData, visibleFloor, furnitureAssets,
       />
       <CameraRig pixelsPerFoot={pixelsPerFoot} />
       <PlanViewController nonce={topDownNonce} sizeX={sceneBox.sizeX} sizeZ={sceneBox.sizeZ} pixelsPerFoot={pixelsPerFoot} controlsRef={controlsRef} />
-      <InvalidateOnChange deps={[floorsData, visibleFloor, visualMetadata, selection, pixelsPerFoot, ambientIntensity, directionalIntensity, windowIntensity, roomLightIntensity, nightMode, sunAzimuthDeg, sunElevationDeg, sunWarmth, exposure]} />
+      <InvalidateOnChange deps={[floorsData, visibleFloor, visualMetadata, selection, pixelsPerFoot, ambientIntensity, directionalIntensity, windowIntensity, roomLightIntensity, nightMode, sunAzimuthDeg, sunElevationDeg, sunWarmth, exposure, personHeightInches]} />
+      <RenderCaptureBridge captureRef={renderCaptureRef} />
       <OrbitControls
         ref={controlsRef}
         makeDefault
@@ -1843,6 +2111,21 @@ export default function FloorPlan3D({ floorsData, visibleFloor, furnitureAssets,
           }
         }}
       />
+      {mode === "walk" && (
+        <WalkController
+          stackY={stackY}
+          sceneCenter={{ x: sceneCenter.x, y: sceneCenter.y }}
+          pixelsPerFoot={pixelsPerFoot}
+          floorsData={floorsData}
+          onWalkFloorChange={onWalkFloorChange}
+          walkPoseRef={walkPoseRef}
+          controlsRef={controlsRef}
+          teleportRef={walkTeleportRef}
+          invalidateRef={walkInvalidateRef}
+          personHeightInches={personHeightInches}
+        />
+      )}
+
       <group position={[-sceneCenter.x, 0, -sceneCenter.y]}>
         <LightingSystem
           floors={lightingInputs.floors}
@@ -1875,7 +2158,7 @@ export default function FloorPlan3D({ floorsData, visibleFloor, furnitureAssets,
               // AND we prop-drill `isInteractive={false}` so every child mesh
               // installs `raycast={() => null}` — hidden objects don't block
               // hover/click on the visible floor beneath them.
-              <group key={`floor_${i}`} position={[0, stackY[i], 0]} visible={isVisible}>
+              <group key={`floor_${i}`} position={[0, stackY[i], 0]} visible={isVisible} userData={{ floorIndex: floorIdx }}>
                 {/* Per-floor ceiling fixture lights (one per room, skipping the building footprint at index 0) */}
                 {isVisible && fd.floors.slice(1).map((room) => {
                   let sx = 0, sy = 0;
@@ -1905,9 +2188,20 @@ export default function FloorPlan3D({ floorsData, visibleFloor, furnitureAssets,
                   pixelsPerFoot={pixelsPerFoot}
                   visualMetadata={visualMetadata}
                   selection={selection}
-                  onSelect={onSelect}
+                  onSelect={guardedOnSelect}
                   isInteractive={isVisible}
+                  walkMode={mode === "walk"}
+                  lowerStairs={
+                    i > 0
+                      ? ((floorsData[i - 1]?.structures ?? []).filter(
+                          (s) => s.kind === "stairs"
+                            && !((s as StairsStructure3D).direction === "DN" && (s as StairsStructure3D).linked_stair_id),
+                        ) as StairsStructure3D[])
+                      : undefined
+                  }
+                  lowerCeilingPx={i > 0 ? inchToPx(floorsData[i - 1]?.ceilingHeightIn ?? 0) : undefined}
                 />
+
               </group>
             );
           })}
@@ -1924,8 +2218,383 @@ export default function FloorPlan3D({ floorsData, visibleFloor, furnitureAssets,
 }
 
 
+// Bridges the R3F renderer/scene/camera out to the parent editor via a ref,
+// so the "Render Engine" panel can capture previews and export high-res PNGs
+// without any DOM scraping. Runs inside <Canvas>.
+function RenderCaptureBridge({ captureRef }: { captureRef?: React.MutableRefObject<RenderCaptureAPI | null> }) {
+  const gl = useThree((s) => s.gl);
+  const scene = useThree((s) => s.scene);
+  const camera = useThree((s) => s.camera);
+  const invalidate = useThree((s) => s.invalidate);
+  const setFrameloop = useThree((s) => s.setFrameloop);
+
+  useEffect(() => {
+    if (!captureRef) return;
+
+    // Hide selection/hover overlays (line-based helpers, EdgesGeometry outlines,
+    // and anything explicitly tagged) for a clean render, then restore.
+    const hideOverlays = (): Array<{ obj: THREE.Object3D; prev: boolean }> => {
+      const changed: Array<{ obj: THREE.Object3D; prev: boolean }> = [];
+      scene.traverse((o) => {
+        const anyO = o as unknown as {
+          isLine?: boolean;
+          isLineSegments?: boolean;
+          isLine2?: boolean;
+          isLineSegments2?: boolean;
+          userData?: { isRenderHidden?: boolean };
+        };
+        const isLineLike =
+          anyO.isLine || anyO.isLineSegments || anyO.isLine2 || anyO.isLineSegments2;
+        const explicit = o.userData?.isRenderHidden === true;
+        if ((isLineLike || explicit) && o.visible) {
+          changed.push({ obj: o, prev: true });
+          o.visible = false;
+        }
+      });
+      return changed;
+    };
+    const restoreOverlays = (changed: Array<{ obj: THREE.Object3D; prev: boolean }>) => {
+      for (const c of changed) c.obj.visible = c.prev;
+    };
+
+    const capturePreview = (quality = 0.6): string | null => {
+      try {
+        const changed = hideOverlays();
+        gl.render(scene, camera);
+        const url = gl.domElement.toDataURL("image/jpeg", quality);
+        restoreOverlays(changed);
+        invalidate();
+        return url;
+      } catch (e) {
+        console.error("[Render] capturePreview failed:", e);
+        return null;
+      }
+    };
+
+    const executeRender = (w: number, h: number): string | null => {
+      const size = gl.getSize(new THREE.Vector2());
+      const dpr = gl.getPixelRatio();
+      const persp = camera as THREE.PerspectiveCamera;
+      const ortho = camera as THREE.OrthographicCamera;
+      const isPersp = (persp as unknown as { isPerspectiveCamera?: boolean })
+        .isPerspectiveCamera === true;
+      const isOrtho = (ortho as unknown as { isOrthographicCamera?: boolean })
+        .isOrthographicCamera === true;
+
+      const prevAspect = isPersp ? persp.aspect : 1;
+      const prevOrtho = isOrtho
+        ? { left: ortho.left, right: ortho.right, top: ortho.top, bottom: ortho.bottom }
+        : null;
+
+      let changed: Array<{ obj: THREE.Object3D; prev: boolean }> = [];
+      try {
+        changed = hideOverlays();
+
+        if (isPersp) {
+          persp.aspect = w / h;
+          persp.updateProjectionMatrix();
+        } else if (isOrtho && prevOrtho) {
+          // Preserve frustum height, rescale left/right to the new aspect.
+          const height = prevOrtho.top - prevOrtho.bottom;
+          const cx = (prevOrtho.left + prevOrtho.right) / 2;
+          const newHalfW = (height * (w / h)) / 2;
+          ortho.left = cx - newHalfW;
+          ortho.right = cx + newHalfW;
+          ortho.updateProjectionMatrix();
+        }
+
+        gl.setPixelRatio(1);
+        gl.setSize(w, h, false);
+        gl.render(scene, camera);
+        const url = gl.domElement.toDataURL("image/png", 1.0);
+        return url;
+      } catch (e) {
+        console.error("[Render] executeRender failed:", e);
+        return null;
+      } finally {
+        gl.setPixelRatio(dpr);
+        gl.setSize(size.x, size.y, false);
+        if (isPersp) {
+          persp.aspect = prevAspect;
+          persp.updateProjectionMatrix();
+        } else if (isOrtho && prevOrtho) {
+          ortho.left = prevOrtho.left;
+          ortho.right = prevOrtho.right;
+          ortho.top = prevOrtho.top;
+          ortho.bottom = prevOrtho.bottom;
+          ortho.updateProjectionMatrix();
+        }
+        restoreOverlays(changed);
+        invalidate();
+      }
+    };
+
+    const getScreenSize = () => {
+      const s = gl.getSize(new THREE.Vector2());
+      const r = gl.getPixelRatio();
+      return { width: Math.round(s.x * r), height: Math.round(s.y * r) };
+    };
+
+    // ---- Studio (path traced) render session -------------------------------
+    let activeSession: {
+      cancel: () => void;
+    } | null = null;
+
+    const startStudio = (w: number, h: number): StudioSession => {
+      // Only one session at a time.
+      if (activeSession) {
+        try { activeSession.cancel(); } catch { /* noop */ }
+        activeSession = null;
+      }
+
+      let rafId: number | null = null;
+      let cancelled = false;
+      let cleanedUp = false;
+      let tracer: import("three-gpu-pathtracer").WebGLPathTracer | null = null;
+
+      const hiddenChanged: Array<{ obj: THREE.Object3D; prev: boolean }> = [];
+      const glassSwaps: Array<{ mesh: THREE.Mesh; prev: THREE.Material | THREE.Material[]; cloned: THREE.Material[] }> = [];
+
+      // Save renderer/camera state.
+      const prevSize = gl.getSize(new THREE.Vector2());
+      const prevDpr = gl.getPixelRatio();
+      const prevAutoClear = gl.autoClear;
+      const prevToneMapping = gl.toneMapping;
+      const prevExposure = gl.toneMappingExposure;
+      const prevOutputColorSpace = gl.outputColorSpace;
+      const prevEnv = scene.environment;
+      const prevBg = scene.background;
+      const persp = camera as THREE.PerspectiveCamera;
+      const isPersp = (persp as unknown as { isPerspectiveCamera?: boolean }).isPerspectiveCamera === true;
+      const prevAspect = isPersp ? persp.aspect : 1;
+      // Kill the R3F loop so it doesn't fight the tracer.
+      const setStore = (useThree as unknown as { getState: () => { set: (partial: Record<string, unknown>) => void; frameloop: string } })
+        // fallback path — inline setter obtained below
+        ;
+      void setStore;
+
+      const cleanup = () => {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        if (rafId !== null) cancelAnimationFrame(rafId);
+        rafId = null;
+        try { tracer?.dispose(); } catch { /* noop */ }
+        tracer = null;
+
+        // Restore glass materials.
+        for (const swap of glassSwaps) {
+          swap.mesh.material = swap.prev;
+          for (const m of swap.cloned) {
+            try { m.dispose(); } catch { /* noop */ }
+          }
+        }
+        glassSwaps.length = 0;
+
+        // Restore visibility.
+        for (const c of hiddenChanged) c.obj.visible = c.prev;
+        hiddenChanged.length = 0;
+
+        // Restore renderer state.
+        gl.setPixelRatio(prevDpr);
+        gl.setSize(prevSize.x, prevSize.y, false);
+        gl.autoClear = prevAutoClear;
+        gl.toneMapping = prevToneMapping;
+        gl.toneMappingExposure = prevExposure;
+        gl.outputColorSpace = prevOutputColorSpace;
+        scene.environment = prevEnv;
+        scene.background = prevBg;
+        if (isPersp) {
+          persp.aspect = prevAspect;
+          persp.updateProjectionMatrix();
+        }
+
+        // Restore R3F frameloop.
+        try { setFrameloop("demand"); } catch { /* noop */ }
+        invalidate();
+        activeSession = null;
+      };
+
+      const start: StudioSession["start"] = async (targetSamples, onProgress, onFrame, onDone, onError) => {
+        try {
+          // Freeze the R3F loop.
+          setFrameloop("never");
+
+          // Hide overlays.
+          const overlays = hideOverlays();
+          for (const o of overlays) hiddenChanged.push(o);
+
+          // Glass upgrade: replace shared/glass materials with per-instance
+          // MeshPhysicalMaterial so the tracer computes refractions.
+          scene.traverse((o) => {
+            const mesh = o as THREE.Mesh;
+            if (!(mesh as THREE.Mesh).isMesh) return;
+            const arr = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+            let hasGlass = false;
+            for (const m of arr) {
+              if (!m) continue;
+              const name = (m.name ?? "").toLowerCase();
+              if (name.includes("glass") || (m as THREE.Material).transparent && (m as THREE.MeshStandardMaterial).opacity < 1 && name === "shared_glass") {
+                hasGlass = true;
+                break;
+              }
+            }
+            if (!hasGlass) return;
+            const clonedList: THREE.Material[] = [];
+            const newArr = arr.map((m) => {
+              if (!m) return m;
+              const name = (m.name ?? "").toLowerCase();
+              if (!name.includes("glass") && name !== "shared_glass") return m;
+              const std = m as THREE.MeshStandardMaterial;
+              const phys = new THREE.MeshPhysicalMaterial({
+                color: std.color ? std.color.clone() : new THREE.Color("#ffffff"),
+                transmission: 1,
+                roughness: 0,
+                metalness: 0,
+                ior: 1.5,
+                thickness: 0.5,
+                transparent: true,
+                opacity: 1,
+                side: THREE.DoubleSide,
+                attenuationDistance: Infinity,
+              });
+              phys.name = "studio_glass";
+              clonedList.push(phys);
+              return phys;
+            });
+            glassSwaps.push({
+              mesh,
+              prev: mesh.material,
+              cloned: clonedList,
+            });
+            mesh.material = Array.isArray(mesh.material) ? newArr : newArr[0]!;
+          });
+
+          // Ensure the scene has an environment for GI. Fall back to a neutral
+          // PMREM room if <Environment> hasn't attached one yet.
+          if (!scene.environment) {
+            const { RoomEnvironment } = await import("three/examples/jsm/environments/RoomEnvironment.js");
+            const pmrem = new THREE.PMREMGenerator(gl);
+            const envTex = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+            scene.environment = envTex;
+            pmrem.dispose();
+          }
+
+          // Resize renderer to target so the tracer allocates matching internal buffers.
+          gl.setPixelRatio(1);
+          gl.setSize(w, h, false);
+          if (isPersp) {
+            persp.aspect = w / h;
+            persp.updateProjectionMatrix();
+          }
+
+          // Build the tracer.
+          const { WebGLPathTracer } = await import("three-gpu-pathtracer");
+          if (cancelled) { cleanup(); return; }
+          tracer = new WebGLPathTracer(gl);
+          tracer.renderScale = 1;
+          tracer.minSamples = 1;
+          tracer.renderDelay = 0;
+          tracer.dynamicLowRes = false;
+
+          // Sanitize scene: hide lines/points and objects with unsupported materials
+          // (ShaderMaterial, LineMaterial) so the path tracer's MaterialsTexture
+          // doesn't crash reading missing PBR props.
+          const incompatibleObjects: THREE.Object3D[] = [];
+          const isUnsupportedMaterial = (mat: any) =>
+            !!mat && (mat.isShaderMaterial || mat.isLineMaterial || mat.type === "LineMaterial");
+          scene.traverse((child: any) => {
+            if (!child.visible) return;
+            let hasUnsupportedMat = false;
+            if (child.material) {
+              hasUnsupportedMat = Array.isArray(child.material)
+                ? child.material.some(isUnsupportedMaterial)
+                : isUnsupportedMaterial(child.material);
+            }
+            if (child.isLine || child.isLineSegments || child.isPoints || hasUnsupportedMat) {
+              child.visible = false;
+              incompatibleObjects.push(child);
+            }
+          });
+
+          try {
+            tracer.setScene(scene, camera);
+          } finally {
+            incompatibleObjects.forEach((obj) => { obj.visible = true; });
+          }
+          if (cancelled) { cleanup(); return; }
+
+          let lastReported = -1;
+          let framesSinceCopy = 0;
+          const loop = () => {
+            if (cancelled || !tracer) return;
+            try {
+              tracer.renderSample();
+            } catch (err) {
+              onError(err);
+              cleanup();
+              return;
+            }
+            const s = Math.floor(tracer.samples);
+            if (s !== lastReported) {
+              lastReported = s;
+              onProgress(s);
+            }
+            // Throttle expensive drawImage to every 3 samples (plus the last one).
+            framesSinceCopy += 1;
+            if (framesSinceCopy >= 3 || s >= targetSamples) {
+              framesSinceCopy = 0;
+              try { onFrame(gl.domElement); } catch { /* noop */ }
+            }
+            if (s >= targetSamples) {
+              onDone();
+              // Keep tracer alive until cancel(), so save() still works.
+              return;
+            }
+            rafId = requestAnimationFrame(loop);
+          };
+          // Emit initial frame so the modal shows something quickly.
+          onProgress(0);
+          rafId = requestAnimationFrame(loop);
+        } catch (err) {
+          onError(err);
+          cleanup();
+        }
+      };
+
+      const cancel = () => {
+        cancelled = true;
+        cleanup();
+      };
+
+      const save = (): string | null => {
+        try {
+          return gl.domElement.toDataURL("image/png", 1.0);
+        } catch (e) {
+          console.error("[Studio] save failed:", e);
+          return null;
+        }
+      };
+
+      activeSession = { cancel };
+      return { start, cancel, save };
+    };
+
+    captureRef.current = { capturePreview, executeRender, getScreenSize, startStudio };
+    return () => {
+      if (activeSession) {
+        try { activeSession.cancel(); } catch { /* noop */ }
+      }
+      captureRef.current = null;
+    };
+  }, [captureRef, gl, scene, camera, invalidate, setFrameloop]);
+
+  return null;
+}
+
+
 // Triggers an explicit invalidate() when any scene-relevant prop changes,
 // so the demand-mode render loop renders exactly one frame per real update.
+
 function InvalidateOnChange({ deps }: { deps: unknown[] }) {
   const invalidate = useThree((s) => s.invalidate);
   useEffect(() => {
@@ -1934,3 +2603,383 @@ function InvalidateOnChange({ deps }: { deps: unknown[] }) {
   }, deps);
   return null;
 }
+
+
+// First-person walk-mode controller: WASD/Arrow movement in the camera's
+// local XZ plane, with a downward raycast every frame to snap the eye height
+// to the surface underfoot (handles stair climbing + floor-to-floor). A short
+// forward raycast against tagged wall groups prevents walking through walls.
+// The controller must live INSIDE <Canvas>; it uses r3f hooks (useThree/useFrame).
+function WalkController({
+  stackY,
+  sceneCenter,
+  pixelsPerFoot,
+  floorsData,
+  onWalkFloorChange,
+  walkPoseRef,
+  controlsRef,
+  teleportRef,
+  invalidateRef,
+  personHeightInches,
+}: {
+  stackY: number[];
+  sceneCenter: { x: number; y: number };
+  pixelsPerFoot: number;
+  floorsData: FloorData[];
+  onWalkFloorChange?: (floor: 1 | 2) => void;
+  walkPoseRef?: WalkPoseRef;
+  controlsRef: React.MutableRefObject<any>;
+  teleportRef?: React.MutableRefObject<{ x: number; z: number; nonce: number }>;
+  invalidateRef?: React.MutableRefObject<(() => void) | null>;
+  personHeightInches: number;
+}) {
+  const camera = useThree((s) => s.camera);
+  const scene = useThree((s) => s.scene);
+  const invalidate = useThree((s) => s.invalidate);
+
+  const keys = useRef<Record<string, boolean>>({});
+  const downRaycaster = useMemo(() => new THREE.Raycaster(), []);
+  const fwdRaycaster = useMemo(() => new THREE.Raycaster(), []);
+  const lastReportedFloor = useRef<1 | 2 | null>(null);
+  const floorSwitchTimer = useRef<number | null>(null);
+  const initedRef = useRef(false);
+  const pendingTeleportRef = useRef<{ x: number; z: number } | null>(null);
+  const lastTeleportNonceRef = useRef<number>(teleportRef?.current?.nonce ?? 0);
+  const savedCameraRef = useRef<{
+    pos: THREE.Vector3;
+    target: THREE.Vector3;
+    enableZoom: boolean;
+    enablePan: boolean;
+    minDistance: number;
+    maxDistance: number;
+  } | null>(null);
+
+  const eyeHeightPx = (personHeightInches / 12) * pixelsPerFoot;
+  const moveSpeedPxPerSec = pixelsPerFoot * 6;
+  const clashDistancePx = pixelsPerFoot * 1.5;
+  const FP_RADIUS = 0.5;
+
+  // Save orbit state on mount; restore on unmount so 3D mode gets a sane camera.
+  useEffect(() => {
+    const controls = controlsRef.current;
+    savedCameraRef.current = {
+      pos: camera.position.clone(),
+      target: controls ? controls.target.clone() : new THREE.Vector3(),
+      enableZoom: controls?.enableZoom ?? true,
+      enablePan: controls?.enablePan ?? true,
+      minDistance: controls?.minDistance ?? 0,
+      maxDistance: controls?.maxDistance ?? Infinity,
+    };
+    return () => {
+      const c = controlsRef.current;
+      const s = savedCameraRef.current;
+      if (c) {
+        c.enableZoom = s?.enableZoom ?? true;
+        c.enablePan = s?.enablePan ?? true;
+        c.minDistance = s?.minDistance ?? 0;
+        c.maxDistance = s?.maxDistance ?? Infinity;
+        // Restore a sensible orbit pivot & camera distance so 3D orbit works.
+        const dist = pixelsPerFoot * 30;
+        camera.position.set(dist, dist, dist);
+        c.target.set(0, 0, 0);
+        camera.lookAt(0, 0, 0);
+        c.update();
+      }
+      invalidate();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Teleport requests are polled every frame from teleportRef (see useFrame).
+
+  // Expose invalidate() to the editor so imperative updates from outside the
+  // Canvas (minimap drag, height slider) can wake the demand render loop.
+  useEffect(() => {
+    if (!invalidateRef) return;
+    invalidateRef.current = invalidate;
+    return () => { invalidateRef.current = null; };
+  }, [invalidate, invalidateRef]);
+
+  // Height slider: apply the delta immediately to both the camera and orbit
+  // target so eye height changes without needing WASD input to wake useFrame.
+  const prevEyeHeightRef = useRef<number>(eyeHeightPx);
+  useEffect(() => {
+    const controls = controlsRef.current;
+    const dy = eyeHeightPx - prevEyeHeightRef.current;
+    prevEyeHeightRef.current = eyeHeightPx;
+    if (Math.abs(dy) < 1e-4) return;
+    camera.position.y += dy;
+    if (controls) {
+      controls.target.y += dy;
+      controls.update();
+    }
+    invalidate();
+  }, [eyeHeightPx, camera, controlsRef, invalidate]);
+
+
+  // Keyboard listeners.
+  useEffect(() => {
+    const dn = (e: KeyboardEvent) => {
+      keys.current[e.code] = true;
+      // Wake the demand frameloop so useFrame starts running while held.
+      invalidate();
+    };
+    const up = (e: KeyboardEvent) => {
+      keys.current[e.code] = false;
+      invalidate();
+    };
+    window.addEventListener("keydown", dn);
+    window.addEventListener("keyup", up);
+    return () => {
+      window.removeEventListener("keydown", dn);
+      window.removeEventListener("keyup", up);
+      keys.current = {};
+    };
+  }, [invalidate]);
+
+  const forwardVec = useMemo(() => new THREE.Vector3(), []);
+  const rightVec = useMemo(() => new THREE.Vector3(), []);
+  const moveVec = useMemo(() => new THREE.Vector3(), []);
+  const rayOrigin = useMemo(() => new THREE.Vector3(), []);
+  const axisVec = useMemo(() => new THREE.Vector3(), []);
+  const DOWN = useMemo(() => new THREE.Vector3(0, -1, 0), []);
+
+  const isTaggedAncestor = useCallback((obj: THREE.Object3D | null, key: string) => {
+    let n: THREE.Object3D | null = obj;
+    while (n) {
+      if (n.userData && n.userData[key]) return true;
+      n = n.parent;
+    }
+    return false;
+  }, []);
+  const findFloorIndex = useCallback((obj: THREE.Object3D | null): 1 | 2 | null => {
+    let n: THREE.Object3D | null = obj;
+    while (n) {
+      const fi = n.userData?.floorIndex;
+      if (fi === 1 || fi === 2) return fi;
+      n = n.parent;
+    }
+    return null;
+  }, []);
+
+  // Collect walkable meshes (ground + walls) from the scene. Rebuilt each
+  // frame via a cheap traverse — this bypasses LineSegments2 (which crashes
+  // manual raycasters without a camera) and is dramatically faster than
+  // sweeping the entire scene graph.
+  const groundMeshes = useMemo<THREE.Object3D[]>(() => [], []);
+  const wallMeshes = useMemo<THREE.Object3D[]>(() => [], []);
+
+  useFrame((_state, rawDelta) => {
+    // Clamp delta: on a demand frameloop, the first frame after wake can have
+    // a huge delta (seconds since last render), causing a teleport-jump on the
+    // first WASD press. Cap at ~50ms so movement is always frame-scale.
+    const delta = Math.min(rawDelta, 0.05);
+    const controls = controlsRef.current;
+    if (!controls) return;
+    const target: THREE.Vector3 = controls.target;
+
+    // Assign camera so any accidental line-based intersect doesn't crash.
+    downRaycaster.camera = camera;
+    fwdRaycaster.camera = camera;
+
+    // First-frame spawn: run only once controls exist so PerspectiveCamera's
+    // makeDefault mount effect can't overwrite our positioning.
+    if (!initedRef.current) {
+      initedRef.current = true;
+      const floor0 = floorsData[0];
+      const prev = walkPoseRef?.current;
+      let wx = 0, wz = 0, yaw = 0;
+      let baseY = (stackY[0] ?? 0) + eyeHeightPx;
+      if (prev?.visited) {
+        wx = prev.x - sceneCenter.x;
+        wz = prev.z - sceneCenter.y;
+        yaw = prev.yaw;
+        const fi = Math.max(1, Math.min(stackY.length, prev.floorIndex ?? 1));
+        baseY = (stackY[fi - 1] ?? stackY[0] ?? 0) + eyeHeightPx;
+      } else {
+        const doors = floor0?.doors ?? [];
+        if (doors.length > 0) {
+          const d = doors[Math.floor(Math.random() * doors.length)];
+          const cx = (d.hinge.x + d.strike.x) / 2;
+          const cy = (d.hinge.y + d.strike.y) / 2;
+          wx = cx - sceneCenter.x;
+          wz = cy - sceneCenter.y;
+          const dx = d.strike.x - d.hinge.x;
+          const dy = d.strike.y - d.hinge.y;
+          yaw = Math.atan2(-dx, -dy);
+        }
+      }
+      camera.position.set(wx, baseY, wz);
+      target.set(
+        wx + Math.sin(yaw) * FP_RADIUS,
+        baseY,
+        wz + Math.cos(yaw) * FP_RADIUS,
+      );
+      camera.lookAt(target);
+      controls.enableZoom = false;
+      controls.enablePan = false;
+      controls.minDistance = FP_RADIUS;
+      controls.maxDistance = FP_RADIUS;
+      controls.update();
+    }
+
+    // Poll teleport ref (from minimap drag). Continuous — applies every frame
+    // the nonce advances, so dragging the dot moves the camera in real time.
+    if (teleportRef?.current && teleportRef.current.nonce !== lastTeleportNonceRef.current) {
+      lastTeleportNonceRef.current = teleportRef.current.nonce;
+      pendingTeleportRef.current = {
+        x: teleportRef.current.x - sceneCenter.x,
+        z: teleportRef.current.z - sceneCenter.y,
+      };
+    }
+
+    // === Sleep state ===
+    // If the walker isn't moving (no WASD held, no pending teleport), skip
+    // all raycasting/traversal/invalidation. OrbitControls itself invalidates
+    // on mouse look via damping, so pure look-around still redraws cleanly.
+    const k = keys.current;
+    const anyKey =
+      k["KeyW"] || k["KeyS"] || k["KeyA"] || k["KeyD"] ||
+      k["ArrowUp"] || k["ArrowDown"] || k["ArrowLeft"] || k["ArrowRight"];
+    const hasTeleport = pendingTeleportRef.current !== null;
+    if (!anyKey && !hasTeleport) {
+      // Idle: still update the pose ref so the minimap cone tracks pure
+      // mouse-look (OrbitControls invalidates on rotation via damping, which
+      // fires this useFrame; we just skip movement math + raycasting).
+      if (walkPoseRef) {
+        const yaw = Math.atan2(target.x - camera.position.x, target.z - camera.position.z);
+        walkPoseRef.current = {
+          x: camera.position.x + sceneCenter.x,
+          z: camera.position.z + sceneCenter.y,
+          yaw,
+          floorIndex: (lastReportedFloor.current ?? 1) as 1 | 2,
+          visited: true,
+        };
+      }
+      return;
+    }
+
+    // Consume any pending teleport.
+    if (pendingTeleportRef.current) {
+      const t = pendingTeleportRef.current;
+      pendingTeleportRef.current = null;
+      const dxT = t.x - camera.position.x;
+      const dzT = t.z - camera.position.z;
+      camera.position.x += dxT;
+      camera.position.z += dzT;
+      target.x += dxT;
+      target.z += dzT;
+      controls.update();
+    }
+
+
+    // Rebuild the walkable mesh caches (cheap; only tagged subtrees matter).
+    groundMeshes.length = 0;
+    wallMeshes.length = 0;
+    scene.traverse((o) => {
+      if (!(o as THREE.Mesh).isMesh) return;
+      if (isTaggedAncestor(o, "walkGround")) groundMeshes.push(o);
+      else if (isTaggedAncestor(o, "walkWall")) wallMeshes.push(o);
+    });
+
+    // Horizontal direction: from camera to target (projected).
+    forwardVec.copy(target).sub(camera.position);
+    forwardVec.y = 0;
+    if (forwardVec.lengthSq() < 1e-6) forwardVec.set(0, 0, 1);
+    forwardVec.normalize();
+    // Right = forward × up (right-handed). Prior code had the sign flipped,
+    // which swapped A and D. Corrected here so D strafes right, A strafes left.
+    rightVec.set(-forwardVec.z, 0, forwardVec.x);
+
+    let fwd = 0, strafe = 0;
+    if (k["KeyW"] || k["ArrowUp"]) fwd += 1;
+    if (k["KeyS"] || k["ArrowDown"]) fwd -= 1;
+    if (k["KeyD"] || k["ArrowRight"]) strafe += 1;
+    if (k["KeyA"] || k["ArrowLeft"]) strafe -= 1;
+
+    if (fwd !== 0 || strafe !== 0) {
+      moveVec.set(0, 0, 0);
+      moveVec.addScaledVector(forwardVec, fwd);
+      moveVec.addScaledVector(rightVec, strafe);
+      if (moveVec.lengthSq() > 0) {
+        moveVec.normalize().multiplyScalar(moveSpeedPxPerSec * delta);
+
+        // Independent X / Z wall clash so the walker slides along walls.
+        if (moveVec.x !== 0) {
+          fwdRaycaster.set(target, axisVec.set(Math.sign(moveVec.x), 0, 0));
+          fwdRaycaster.far = clashDistancePx + Math.abs(moveVec.x);
+          const hits = fwdRaycaster.intersectObjects(wallMeshes, false);
+          if (hits.length > 0) moveVec.x = 0;
+        }
+        if (moveVec.z !== 0) {
+          fwdRaycaster.set(target, axisVec.set(0, 0, Math.sign(moveVec.z)));
+          fwdRaycaster.far = clashDistancePx + Math.abs(moveVec.z);
+          const hits = fwdRaycaster.intersectObjects(wallMeshes, false);
+          if (hits.length > 0) moveVec.z = 0;
+        }
+
+        // Move BOTH target and camera by same XZ delta to preserve orbit.
+        target.x += moveVec.x;
+        target.z += moveVec.z;
+        camera.position.x += moveVec.x;
+        camera.position.z += moveVec.z;
+      }
+    }
+
+    // Downward raycast from above the walker to snap ground height.
+    rayOrigin.copy(target);
+    rayOrigin.y += eyeHeightPx * 3;
+    downRaycaster.set(rayOrigin, DOWN);
+    downRaycaster.far = eyeHeightPx * 20;
+    const dhits = downRaycaster.intersectObjects(groundMeshes, false);
+
+    let bestY: number | null = null;
+    let bestFloor: 1 | 2 | null = null;
+    for (const h of dhits) {
+      if (h.point.y > target.y + eyeHeightPx * 0.5) continue;
+      if (bestY === null || h.point.y > bestY) {
+        bestY = h.point.y;
+        bestFloor = findFloorIndex(h.object);
+      }
+    }
+
+    if (bestY !== null) {
+      const targetY = bestY + eyeHeightPx;
+      const newY = THREE.MathUtils.lerp(target.y, targetY, Math.min(1, delta * 12));
+      const dy = newY - target.y;
+      target.y += dy;
+      camera.position.y += dy;
+    }
+
+    controls.update();
+
+
+    if (bestFloor && bestFloor !== lastReportedFloor.current) {
+      if (floorSwitchTimer.current) window.clearTimeout(floorSwitchTimer.current);
+      const t = bestFloor;
+      floorSwitchTimer.current = window.setTimeout(() => {
+        lastReportedFloor.current = t;
+        onWalkFloorChange?.(t);
+      }, 250);
+    }
+
+    if (walkPoseRef) {
+      // Yaw derived from camera->target so the minimap cone matches view.
+      const yaw = Math.atan2(target.x - camera.position.x, target.z - camera.position.z);
+      walkPoseRef.current = {
+        x: camera.position.x + sceneCenter.x,
+        z: camera.position.z + sceneCenter.y,
+        yaw,
+        floorIndex: (lastReportedFloor.current ?? bestFloor ?? 1) as 1 | 2,
+        visited: true,
+      };
+    }
+
+    // Keep the demand loop alive while any movement key is held.
+    if (anyKey) invalidate();
+  });
+
+  return null;
+}
+
+

@@ -41,8 +41,16 @@ import {
   ArrowLeftRight,
   Grip,
   Orbit,
+  Rotate3D,
+  Rotate3DIcon,
   Map as MapIcon,
+  Ruler,
   SunMedium,
+  Footprints,
+  Camera as CameraIcon,
+  RefreshCw,
+  Loader2,
+  Download,
   type LucideIcon,
 } from "lucide-react";
 
@@ -84,7 +92,9 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import samplePlan from "@/data/sample-plan";
-import FloorPlan3D, { type Selection3D, type VisualMetadata } from "@/components/FloorPlan3D";
+import FloorPlan3D, { type Selection3D, type VisualMetadata, type WalkPose, type RenderCaptureAPI } from "@/components/FloorPlan3D";
+import { WalkMinimap } from "@/components/WalkMinimap";
+import StudioRenderModal from "@/components/StudioRenderModal";
 import { FURNITURE_TYPE_TO_CATEGORY } from "@/components/Furniture3D";
 import { useMaterials } from "@/lib/materials";
 import { useAssets, type AssetModel, type AssetCategory } from "@/lib/assets";
@@ -92,6 +102,7 @@ import polygonClipping from "polygon-clipping";
 import {
   shiftFloorCoordinates,
   buildMasterStairs,
+  computeStairHeadroomCutouts,
   type StairLike,
 } from "@/lib/stairLogic";
 import { FloorAlignmentDialog } from "@/components/FloorAlignmentDialog";
@@ -1593,7 +1604,7 @@ export default function FloorPlanEditor() {
 
 
   // 3D view state
-  const [viewMode, setViewMode] = useState<"2D" | "3D">("2D");
+  const [viewMode, setViewMode] = useState<"2D" | "3D" | "Walk">("2D");
   const [visualMetadata, setVisualMetadata] = useState<VisualMetadata>({});
   const { materials: allMaterials, loading: materialsLoading, error: materialsError } = useMaterials();
   const { assets: allAssets, loading: assetsLoading, error: assetsError } = useAssets();
@@ -1605,6 +1616,7 @@ export default function FloorPlanEditor() {
     wall: allMaterials.find((m) => m.category === "wall" && m.is_default),
     baseboard: allMaterials.find((m) => m.category === "baseboard" && m.is_default),
     stairs: allMaterials.find((m) => m.category === "stairs" && m.is_default),
+    ceiling: allMaterials.find((m) => m.category === "ceiling" && m.is_default),
   }), [allMaterials]);
   const defaultAssets = useMemo(() => ({
     door: allAssets.find((a) => a.category === "door" && a.is_default),
@@ -1631,7 +1643,52 @@ export default function FloorPlanEditor() {
   const [exposure, setExposure] = useState<number>(1.0);
   const [nightMode, setNightMode] = useState<boolean>(false);
   const [scene3DKey, setScene3DKey] = useState(0); // bump to reset camera
-  const [tool3D, setTool3D] = useState<"orbit" | "plan" | "scene">("orbit");
+  const walkPoseRef = useRef<WalkPose>({ x: 0, z: 0, yaw: 0, floorIndex: 1 });
+  const walkTeleportRef = useRef<{ x: number; z: number; nonce: number }>({ x: 0, z: 0, nonce: 0 });
+  const walkInvalidateRef = useRef<(() => void) | null>(null);
+  const [personHeightInches, setPersonHeightInches] = useState<number>(70); // 5'-10"
+  const [tool3D, setTool3D] = useState<"orbit" | "plan" | "scene" | "person" | "render">("orbit");
+  const personPanelRef = useRef<HTMLDivElement | null>(null);
+  const renderPanelRef = useRef<HTMLDivElement | null>(null);
+  const renderCaptureRef = useRef<RenderCaptureAPI | null>(null);
+  const [renderPreviewURL, setRenderPreviewURL] = useState<string | null>(null);
+  const [renderResolution, setRenderResolution] = useState<"screen" | "1080p" | "4k" | "8k">("1080p");
+  const [renderEngine, setRenderEngine] = useState<"fast" | "studio">("fast");
+  const [renderSamples, setRenderSamples] = useState<number>(100);
+  const [renderBusy, setRenderBusy] = useState(false);
+  const [studioOpen, setStudioOpen] = useState(false);
+  const [studioDims, setStudioDims] = useState<{ width: number; height: number }>({ width: 1920, height: 1080 });
+  useEffect(() => {
+    if (tool3D !== "person") return;
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node | null;
+      if (personPanelRef.current && t && personPanelRef.current.contains(t)) return;
+      setTool3D("orbit");
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [tool3D]);
+  useEffect(() => {
+    if (tool3D !== "render") return;
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node | null;
+      if (renderPanelRef.current && t && renderPanelRef.current.contains(t)) return;
+      setTool3D("orbit");
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [tool3D]);
+  // Refresh the preview whenever the Render panel opens.
+  useEffect(() => {
+    if (tool3D !== "render") return;
+    // Wait a frame so any prior invalidate() has painted.
+    const raf = requestAnimationFrame(() => {
+      const url = renderCaptureRef.current?.capturePreview(0.6) ?? null;
+      if (url) setRenderPreviewURL(url);
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [tool3D]);
+
   const [topDownNonce, setTopDownNonce] = useState(0);
   const [visibleFloor, setVisibleFloor] = useState<"ALL" | 1 | 2>("ALL");
   const [floorSnapshotTick, setFloorSnapshotTick] = useState(0);
@@ -2309,6 +2366,7 @@ export default function FloorPlanEditor() {
       const visible = activeFloor === 2 ? s2 : s1;
       if (visible) hydrateFromSnapshot(visible as any);
       if (activeFloor === 2) injectMastersForFloor2();
+      setFloorSnapshotTick((t) => t + 1);
     } catch (linkErr) {
       console.error("[stairLogic] Master Stair merge failed:", linkErr);
     } finally {
@@ -2330,7 +2388,7 @@ export default function FloorPlanEditor() {
   // When entering 3D, capture the active floor's live edits into the snapshot
   // ref so the multi-floor 3D renderer sees the freshest state.
   useEffect(() => {
-    if (viewMode !== "3D") return;
+    if (viewMode !== "3D" && viewMode !== "Walk") return;
     saveActiveFloorSnapshot();
     setFloorSnapshotTick((t) => t + 1);
   }, [viewMode, saveActiveFloorSnapshot]);
@@ -2467,6 +2525,16 @@ export default function FloorPlanEditor() {
           }
         }
       }
+      if (defaultMaterials.ceiling) {
+        const assignment = matToAssignment(defaultMaterials.ceiling);
+        for (const f of currentFloors) {
+          const key = `ceiling_${f.id}`;
+          if (!next[key]?.material) {
+            next[key] = { ...next[key], material: assignment };
+            changed = true;
+          }
+        }
+      }
       return changed ? next : m;
     });
 
@@ -2565,6 +2633,20 @@ export default function FloorPlanEditor() {
   };
 
   const deleteSelectedItem = () => {
+    // Ceiling is a virtual object sharing the floor's id — delete only the
+    // ceiling's visual metadata, never the underlying floor polygon.
+    if (selection3D?.kind === "ceiling") {
+      const cid = `ceiling_${selection3D.id}`;
+      pushHistory();
+      setVisualMetadata((m) => {
+        if (!m[cid]) return m;
+        const next = { ...m };
+        delete next[cid];
+        return next;
+      });
+      setSelection3D(null);
+      return;
+    }
     if (!selectedId) return;
     pushHistory();
     // Non-blocking: React can interrupt the 3D-tree reconciliation for pointer
@@ -2578,6 +2660,7 @@ export default function FloorPlanEditor() {
       setTexts((p) => p.filter((t) => t.id !== selectedId));
       setStructures((p) => p.filter((s) => s.id !== selectedId));
       setSelectedId(null);
+      setSelection3D(null);
     });
   };
 
@@ -2984,6 +3067,9 @@ export default function FloorPlanEditor() {
         },
       };
       calibratedFloorsRef.current.add(activeFloor);
+      // Force downstream memos (headroom cutouts, floorsData3D, mergedVisualMetadata3D)
+      // to re-derive from the freshly calibrated snapshot ref.
+      setFloorSnapshotTick((t) => t + 1);
 
       // --- 6) Sequence multi-floor calibration: F1 → F2 → auto-math ---
       if (
@@ -4634,6 +4720,96 @@ export default function FloorPlanEditor() {
     });
 
 
+  // "Open to Below" — headroom cutouts from stairs on the floor below,
+  // drafted onto this floor as dashed CAD footprints. Derived, no state.
+  const headroomCutoutPolys = useMemo<{ x: number; y: number }[][]>(() => {
+    if (activeFloor !== 2) return [];
+    // Prefer live injected master stairs from Floor 1 (present in current
+    // `structures` tagged with __from_master_floor). Fall back to the snapshot
+    // so cutouts still appear if masters haven't been injected yet.
+    const liveMasters = (structures as any[]).filter(
+      (s) => s?.kind === "stairs" && s.__from_master_floor,
+    );
+    let lowerStairs: any[] = liveMasters;
+    if (lowerStairs.length === 0) {
+      const snap1 = floorSnapshotsRef.current[1];
+      if (!snap1) return [];
+      const lowerStructures = (snap1.structures ?? []) as any[];
+      lowerStairs = lowerStructures.filter(
+        (s) => s?.kind === "stairs"
+          && !s.__from_master_floor
+          && !(s.direction === "DN" && s.linked_stair_id),
+      );
+    }
+    if (lowerStairs.length === 0) return [];
+    const snap1 = floorSnapshotsRef.current[1];
+    const lowerCeilingIn = snap1?.ceilingHeightIn ?? ceilingHeightIn;
+    const lowerCeilingPx = lowerCeilingIn * PIXELS_PER_WORLD_INCH;
+    const headroomPx = 80 * PIXELS_PER_WORLD_INCH;
+    const preferredTreadDepthPx = 10.5 * PIXELS_PER_WORLD_INCH;
+    const out: { x: number; y: number }[][] = [];
+    for (const s of lowerStairs) {
+      const widthPx = (s.width_in ?? 36) * PIXELS_PER_WORLD_INCH;
+      const rects = computeStairHeadroomCutouts(
+        s as StairLike,
+        lowerCeilingPx,
+        widthPx,
+        headroomPx,
+        preferredTreadDepthPx,
+      );
+      for (const r of rects) out.push(r);
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeFloor, structures, walls, pixelsPerFoot, floorSnapshotTick, ceilingHeightIn]);
+
+
+  const renderHeadroomCutouts = () => {
+    if (headroomCutoutPolys.length === 0) return null;
+    const sw = 1.25 / viewport.zoom;
+    const dash = `${5 / viewport.zoom} ${4 / viewport.zoom}`;
+    return (
+      <g pointerEvents="none">
+        {headroomCutoutPolys.map((poly, i) => (
+          <polygon
+            key={`headroom-${i}`}
+            points={poly.map((p) => `${p.x},${p.y}`).join(" ")}
+            fill="#b91c1c"
+            fillOpacity={0.06}
+            stroke="#b91c1c"
+            strokeOpacity={0.75}
+            strokeWidth={sw}
+            strokeDasharray={dash}
+            strokeLinejoin="round"
+          />
+        ))}
+        {/* Center label — "OPEN TO BELOW" */}
+        {headroomCutoutPolys.map((poly, i) => {
+          if (poly.length < 3) return null;
+          let cx = 0, cy = 0;
+          for (const p of poly) { cx += p.x; cy += p.y; }
+          cx /= poly.length; cy /= poly.length;
+          return (
+            <text
+              key={`headroom-label-${i}`}
+              x={cx}
+              y={cy}
+              textAnchor="middle"
+              dominantBaseline="middle"
+              fontSize={5 * PIXELS_PER_WORLD_INCH}
+              fontWeight={600}
+              fill="#b91c1c"
+              opacity={0.7}
+              style={{ userSelect: "none" }}
+            >
+              OPEN TO BELOW
+            </text>
+          );
+        })}
+      </g>
+    );
+  };
+
   const renderFloors = () =>
     floors.map((floor) => {
       const sel = floor.id === selectedId;
@@ -5646,7 +5822,10 @@ export default function FloorPlanEditor() {
     <TooltipProvider delayDuration={100}>
       <div className="relative h-screen w-screen overflow-hidden bg-background text-foreground">
       {/* LEFT FLOATING PANEL */}
-      <aside className="absolute top-4 left-4 bottom-4 z-20 w-[320px] flex flex-col rounded-2xl border border-border bg-card/95 backdrop-blur shadow-xl overflow-hidden">
+      <aside className={cn(
+        "absolute top-4 left-4 bottom-4 z-20 w-[320px] flex flex-col rounded-2xl border border-border bg-card/95 backdrop-blur shadow-xl overflow-hidden transition-transform duration-300",
+        viewMode === "Walk" && !selection3D && "-translate-x-[340px]",
+      )}>
         <div className="px-5 py-4 border-b border-border">
           <div className="flex items-center gap-2">
             <div className="h-8 w-8 rounded-md bg-primary flex items-center justify-center">
@@ -5967,17 +6146,36 @@ export default function FloorPlanEditor() {
                       const dx = target.x - (rBbox.x + rBbox.w / 2);
                       const dy = target.y - (rBbox.y + rBbox.h / 2);
                       const newPoly = resized.map((p) => ({ x: p.x + dx, y: p.y + dy }));
-                      // Reset start/end so the 3D renderer re-derives entry/exit
-                      // midpoints from the resized polygon. Otherwise a stale start
-                      // (from the old width) shifts Flight #2's landing perpendicular
-                      // to Flight #1 by ±(newWidth - oldWidth)/2 in world space —
-                      // making an L/U stair against a wall drift into or away from it.
-                      // Straight stairs anchor Flight #1 symmetrically so this only
-                      // visibly affects L/U shapes.
+                      // Preserve the current start/end intent across width changes.
+                      // Clearing these makes L/U cutouts fall back to whichever open
+                      // edge the rebuilt polygon returns first, which can reverse the
+                      // initial-run direction until the user presses Switch Start/End.
+                      const oldWidthPx = inchesToPx(s.width_in ?? DEFAULT_STAIR_WIDTH_IN);
+                      const oldEnds = getStairOpenEnds(s.polygon, sh, oldWidthPx);
+                      const newEnds = getStairOpenEnds(newPoly, sh, widthPx);
+                      const mapEnd = (pt: Pt | undefined, fallbackIndex: number): Pt | undefined => {
+                        if (newEnds.length === 0) return pt;
+                        const source = pt ?? oldEnds[fallbackIndex]?.mid;
+                        if (!source) return newEnds[Math.min(fallbackIndex, newEnds.length - 1)]?.mid;
+                        let best = newEnds[0];
+                        let bestD = Infinity;
+                        for (const candidate of newEnds) {
+                          const d = (candidate.mid.x - source.x) ** 2 + (candidate.mid.y - source.y) ** 2;
+                          if (d < bestD) { bestD = d; best = candidate; }
+                        }
+                        return { x: best.mid.x, y: best.mid.y };
+                      };
                       // Keep rotation_anchor identical for the same reason as
                       // changeShape: mutating the pivot while rotation_rad != 0
                       // teleports the stair on-screen.
-                      return { ...s, width_in: newWidthIn, polygon: newPoly, rotation_anchor: s.rotation_anchor ?? target, start: undefined, end: undefined };
+                      return {
+                        ...s,
+                        width_in: newWidthIn,
+                        polygon: newPoly,
+                        rotation_anchor: s.rotation_anchor ?? target,
+                        start: mapEnd(s.start, 0),
+                        end: mapEnd(s.end, 1),
+                      };
                     }),
                   );
                 };
@@ -6656,25 +6854,29 @@ export default function FloorPlanEditor() {
           )}
 
           {/* 3D Material Picker — when a wall, floor, or baseboard is selected */}
-          {viewMode === "3D" && selection3D && (selection3D.kind === "wall" || selection3D.kind === "floor" || selection3D.kind === "baseboard") && (
+          {(viewMode === "3D" || viewMode === "Walk") && selection3D && (selection3D.kind === "wall" || selection3D.kind === "floor" || selection3D.kind === "baseboard" || selection3D.kind === "ceiling") && (
             <section>
               <h2 className="text-[11px] uppercase tracking-wider text-muted-foreground mb-2 font-semibold">
-                {selection3D.kind === "baseboard" ? "Baseboard Material" : "Material Picker"}
+                {selection3D.kind === "baseboard" ? "Baseboard Material" : selection3D.kind === "ceiling" ? "Ceiling Material" : "Material Picker"}
               </h2>
               {(() => {
                 const kind = selection3D.kind;
                 const metadataKey =
-                  kind === "baseboard" ? `baseboard_${selection3D.id}` : selection3D.id;
+                  kind === "baseboard" ? `baseboard_${selection3D.id}`
+                  : kind === "ceiling" ? `ceiling_${selection3D.id}`
+                  : selection3D.id;
                 const currentMaterial = visualMetadata[metadataKey]?.material;
                 const currentScale = visualMetadata[metadataKey]?.tile_scale ?? 1;
                 const currentTint = visualMetadata[metadataKey]?.tint;
-                const materialCategory = kind === "baseboard" ? "baseboard" : kind;
+                const materialCategory = kind === "baseboard" ? "baseboard" : kind === "ceiling" ? "ceiling" : kind;
                 const filteredMaterials = allMaterials.filter((mat) => mat.category === materialCategory);
                 const targetIds =
                   kind === "wall"
                     ? walls.map((w) => w.id)
                     : kind === "floor"
                     ? floors.map((f) => f.id)
+                    : kind === "ceiling"
+                    ? floors.map((f) => `ceiling_${f.id}`)
                     : walls.map((w) => `baseboard_${w.id}`);
                 
 
@@ -6845,7 +7047,7 @@ export default function FloorPlanEditor() {
               (treads+landings, risers, stringers) each hidden under an
               accordion; opening one reveals its material picker + tile scale
               + tint. */}
-          {viewMode === "3D" && selection3D && selection3D.kind === "stairs" && (
+          {(viewMode === "3D" || viewMode === "Walk") && selection3D && selection3D.kind === "stairs" && (
             <section>
               <h2 className="text-[11px] uppercase tracking-wider text-muted-foreground mb-2 font-semibold">
                 Stairs Material
@@ -7049,7 +7251,7 @@ export default function FloorPlanEditor() {
 
 
           {/* Model Picker — only when a door or window is selected, scoped to that category */}
-          {viewMode === "3D" && selection3D && (selection3D.kind === "door" || selection3D.kind === "window") && !(selection3D.kind === "door" && doors.find((d) => d.id === selection3D.id)?.is_arch) && (
+          {(viewMode === "3D" || viewMode === "Walk") && selection3D && (selection3D.kind === "door" || selection3D.kind === "window") && !(selection3D.kind === "door" && doors.find((d) => d.id === selection3D.id)?.is_arch) && (
             <section>
               {(() => {
                 const selWin =
@@ -7240,7 +7442,7 @@ export default function FloorPlanEditor() {
           )}
 
           {/* Furniture Model Picker — only when a furniture item is selected in 3D */}
-          {viewMode === "3D" && selection3D?.kind === "furniture" && (() => {
+          {(viewMode === "3D" || viewMode === "Walk") && selection3D?.kind === "furniture" && (() => {
             const selFurn = furniture.find((f) => f.id === selection3D.id);
             if (!selFurn) return null;
             const cat = FURNITURE_TYPE_TO_CATEGORY[selFurn.type];
@@ -7475,6 +7677,7 @@ export default function FloorPlanEditor() {
               pointerEvents="none"
             />
             {renderFloors()}
+            {renderHeadroomCutouts()}
             {renderFurniture()}
             {renderStructures()}
             {renderTexts()}
@@ -7943,7 +8146,7 @@ export default function FloorPlanEditor() {
         
         )}
 
-        {viewMode === "3D" && (
+        {(viewMode === "3D" || viewMode === "Walk") && (
           <div
             key={scene3DKey}
             className="absolute inset-0"
@@ -7952,6 +8155,9 @@ export default function FloorPlanEditor() {
             }}
           >
             <FloorPlan3D
+              mode={viewMode === "Walk" ? "walk" : "orbit"}
+              walkPoseRef={walkPoseRef}
+              onWalkFloorChange={(f) => { if (f !== activeFloor) switchActiveFloor(f); }}
               floorsData={floorsData3D}
               visibleFloor={visibleFloor}
               furnitureAssets={allAssets}
@@ -8001,7 +8207,10 @@ export default function FloorPlanEditor() {
                   }
                 }
                 setSelection3D(s);
-                setSelectedId(s?.id ?? null);
+                // Ceiling shares its id with the underlying floor. Don't sync
+                // selectedId or the 2D "Room" panel + Delete-floor button
+                // would target the wrong object.
+                setSelectedId(s && s.kind !== "ceiling" ? s.id : null);
               }}
               ambientIntensity={ambientIntensity * exposure}
               directionalIntensity={directionalIntensity * exposure}
@@ -8014,8 +8223,28 @@ export default function FloorPlanEditor() {
               exposure={exposure}
               onZoomChange={setZoom3D}
               topDownNonce={topDownNonce}
+              walkTeleportRef={walkTeleportRef}
+              walkInvalidateRef={walkInvalidateRef}
+              personHeightInches={personHeightInches}
+              renderCaptureRef={renderCaptureRef}
             />
           </div>
+        )}
+
+        {viewMode === "Walk" && (
+          <WalkMinimap
+            floorData={floorsData3D.find((_, i) => (i + 1) === activeFloor) ?? floorsData3D[0] ?? null}
+            poseRef={walkPoseRef}
+            activeFloor={activeFloor}
+            onTeleport={(wx, wz) => {
+              walkTeleportRef.current.x = wx;
+              walkTeleportRef.current.z = wz;
+              walkTeleportRef.current.nonce += 1;
+              // Wake the demand render loop so useFrame consumes the teleport
+              // and the camera moves in real time while dragging.
+              walkInvalidateRef.current?.();
+            }}
+          />
         )}
 
         {/* Floor visibility toggle — 3D only, shows when 2+ floors uploaded */}
@@ -8039,9 +8268,9 @@ export default function FloorPlanEditor() {
         )}
 
 
-        {/* TOP-CENTER 2D / 3D toggle */}
+        {/* TOP-CENTER 2D / 3D / Walk toggle */}
         <div className="absolute top-4 left-1/2 -translate-x-1/2 z-30 flex rounded-xl border border-border bg-card/95 backdrop-blur shadow-md p-1 gap-1">
-          {(["2D", "3D"] as const).map((m) => (
+          {(["2D", "3D", "Walk"] as const).map((m) => (
             <Tooltip key={m}>
               <TooltipTrigger asChild>
                 <button
@@ -8049,24 +8278,25 @@ export default function FloorPlanEditor() {
                     setViewMode(m);
                     setSelectedId(null);
                     setSelection3D(null);
-                    if (m === "3D") {
+                    if (m === "3D" || m === "Walk") {
                       setDrawMode(null);
                       setDrawMenuOpen(false);
                       setTool3D("orbit");
                     }
                   }}
                   className={cn(
-                    "px-4 h-8 rounded-lg text-xs font-semibold tracking-wide transition-colors",
+                    "px-4 h-8 rounded-lg text-xs font-semibold tracking-wide transition-colors flex items-center gap-1.5",
                     viewMode === m
                       ? "bg-primary text-primary-foreground shadow"
                       : "text-foreground hover:bg-accent",
                   )}
                 >
+                  {m === "Walk" && <Footprints className="h-3.5 w-3.5" />}
                   {m}
                 </button>
               </TooltipTrigger>
               <TooltipContent>
-                <p>{m === "2D" ? "2D View" : "3D View"}</p>
+                <p>{m === "2D" ? "2D View" : m === "3D" ? "3D View" : "First-person walkthrough"}</p>
               </TooltipContent>
             </Tooltip>
           ))}
@@ -8077,8 +8307,9 @@ export default function FloorPlanEditor() {
 
         {/* Zoom badge */}
         <div className="absolute bottom-6 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-full bg-card/95 backdrop-blur border border-border text-xs font-mono text-foreground shadow-md">
-          {((viewMode === "3D" ? zoom3D : viewport.zoom) * 100).toFixed(0)}%
+          {((viewMode === "3D" || viewMode === "Walk" ? zoom3D : viewport.zoom) * 100).toFixed(0)}%
         </div>
+
 
         {/* Floor toggler */}
         {uploadedFloorCount > 0 && viewMode === "2D" && (
@@ -8516,8 +8747,8 @@ export default function FloorPlanEditor() {
         </div>
         </>)}
 
-        {/* 3D right-side toolbar (orbit / plan / scene) */}
-        {viewMode === "3D" && (
+        {/* 3D / Walk right-side toolbar (orbit / plan / scene / person) */}
+        {(viewMode === "3D" || viewMode === "Walk") && (
           <div className="absolute top-1/2 -translate-y-1/2 right-4 z-30 flex flex-col gap-1 rounded-2xl border border-border bg-card/95 backdrop-blur shadow-xl p-1.5">
             <Tooltip>
               <TooltipTrigger asChild>
@@ -8529,7 +8760,7 @@ export default function FloorPlanEditor() {
                     tool3D === "orbit" ? "bg-primary text-primary-foreground shadow" : "hover:bg-accent text-foreground",
                   )}
                 >
-                  <Orbit className="h-4 w-4" />
+                  <Rotate3DIcon className="h-4 w-4" />
                 </button>
               </TooltipTrigger>
               <TooltipContent><p>Orbit — drag to rotate, scroll to zoom</p></TooltipContent>
@@ -8571,11 +8802,228 @@ export default function FloorPlanEditor() {
               </TooltipTrigger>
               <TooltipContent><p>3D Scene — lighting &amp; sun</p></TooltipContent>
             </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  aria-label="Person height"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setTool3D((t) => (t === "person" ? "orbit" : "person"));
+                  }}
+                  className={cn(
+                    "h-10 w-10 rounded-xl flex items-center justify-center transition-colors",
+                    tool3D === "person" ? "bg-primary text-primary-foreground shadow" : "hover:bg-accent text-foreground",
+                  )}
+                >
+                  <Ruler className="h-4 w-4" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent><p>Person height — Walk-mode eye level</p></TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  aria-label="Render"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setTool3D((t) => (t === "render" ? "orbit" : "render"));
+                  }}
+                  className={cn(
+                    "h-10 w-10 rounded-xl flex items-center justify-center transition-colors",
+                    tool3D === "render" ? "bg-primary text-primary-foreground shadow" : "hover:bg-accent text-foreground",
+                  )}
+                >
+                  <CameraIcon className="h-4 w-4" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent><p>Render — high-resolution snapshot</p></TooltipContent>
+            </Tooltip>
           </div>
         )}
 
+        {/* Person-height slide-in panel */}
+        {(viewMode === "3D" || viewMode === "Walk") && (
+          <div
+            ref={personPanelRef}
+            onMouseDown={(e) => e.stopPropagation()}
+            className={cn(
+              "absolute top-1/2 -translate-y-1/2 right-20 z-20 w-[140px] rounded-2xl border border-border bg-card/95 backdrop-blur shadow-xl p-3 transition-all duration-300 ease-out",
+              tool3D === "person"
+                ? "translate-x-0 opacity-100 pointer-events-auto"
+                : "translate-x-[calc(100%+6rem)] opacity-0 pointer-events-none",
+            )}
+          >
+            <div className="flex flex-col items-center mb-2">
+              <h3 className="text-[11px] uppercase tracking-wider text-muted-foreground font-semibold">Person height</h3>
+              <span className="text-[11px] font-mono text-foreground mt-1">
+                {Math.floor(personHeightInches / 12)}'-{Math.round(personHeightInches % 12)}"
+              </span>
+            </div>
+            <div className="flex items-stretch justify-center gap-3 h-[240px]">
+              <div className="flex flex-col justify-between text-[9px] text-muted-foreground py-1">
+                <span>7'-0"</span>
+                <span>6'-0"</span>
+                <span>5'-0"</span>
+                <span>4'-0"</span>
+              </div>
+              <Slider
+                orientation="vertical"
+                value={[personHeightInches]}
+                min={48}
+                max={84}
+                step={1}
+                onValueChange={(v) => setPersonHeightInches(v[0])}
+                className="h-full"
+              />
+            </div>
+            <button
+              onClick={() => setPersonHeightInches(70)}
+              className="mt-3 w-full text-[11px] py-1 rounded-md border border-border hover:bg-accent transition-colors text-muted-foreground"
+            >
+              Reset to 5'-10"
+            </button>
+          </div>
+        )}
+
+        {/* Render slide-in panel */}
+        {(viewMode === "3D" || viewMode === "Walk") && (
+          <div
+            ref={renderPanelRef}
+            onMouseDown={(e) => e.stopPropagation()}
+            className={cn(
+              "absolute top-1/2 -translate-y-1/2 right-20 z-20 w-[280px] rounded-2xl border border-border bg-card/95 backdrop-blur shadow-xl p-3 space-y-3 transition-all duration-300 ease-out",
+              tool3D === "render"
+                ? "translate-x-0 opacity-100 pointer-events-auto"
+                : "translate-x-[calc(100%+6rem)] opacity-0 pointer-events-none",
+            )}
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="text-[11px] uppercase tracking-wider text-muted-foreground font-semibold">Render</h3>
+              <button
+                aria-label="Refresh preview"
+                onClick={() => {
+                  const url = renderCaptureRef.current?.capturePreview(0.6) ?? null;
+                  if (url) setRenderPreviewURL(url);
+                }}
+                className="h-6 w-6 rounded-md hover:bg-accent flex items-center justify-center text-muted-foreground"
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+              </button>
+            </div>
+
+            <div className="w-full aspect-video rounded-md border border-border bg-muted overflow-hidden flex items-center justify-center">
+              {renderPreviewURL ? (
+                <img src={renderPreviewURL} alt="Render preview" className="w-full h-full object-cover" />
+              ) : (
+                <span className="text-[11px] text-muted-foreground">No preview yet</span>
+              )}
+            </div>
+
+            <div>
+              <label className="text-[11px] uppercase tracking-wider text-muted-foreground font-semibold block mb-1">Engine</label>
+              <Select value={renderEngine} onValueChange={(v) => {
+                const next = v as "fast" | "studio";
+                setRenderEngine(next);
+                if (next === "studio" && (renderResolution === "4k" || renderResolution === "8k")) {
+                  setRenderResolution("1080p");
+                }
+              }}>
+                <SelectTrigger className="h-8 text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="fast">Fast (Instant WebGL)</SelectItem>
+                  <SelectItem value="studio">Studio (Path Tracer)</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div>
+              <label className="text-[11px] uppercase tracking-wider text-muted-foreground font-semibold block mb-1">Resolution</label>
+              <Select value={renderResolution} onValueChange={(v) => setRenderResolution(v as typeof renderResolution)}>
+                <SelectTrigger className="h-8 text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="screen">Screen size</SelectItem>
+                  <SelectItem value="1080p">HD 1080p (1920 × 1080)</SelectItem>
+                  <SelectItem value="4k" disabled={renderEngine === "studio"}>4K UHD (3840 × 2160)</SelectItem>
+                  <SelectItem value="8k" disabled={renderEngine === "studio"}>8K UHD (7680 × 4320)</SelectItem>
+                </SelectContent>
+              </Select>
+              {renderEngine === "studio" && (
+                <p className="text-[10px] text-muted-foreground mt-1">Studio mode is capped at 1080p to protect the GPU.</p>
+              )}
+            </div>
+
+            {renderEngine === "studio" && (
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-[11px] uppercase tracking-wider text-muted-foreground font-semibold">Sample Size</label>
+                  <span className="text-[11px] font-mono text-foreground">{renderSamples}</span>
+                </div>
+                <Slider
+                  value={[renderSamples]}
+                  min={100}
+                  max={1000}
+                  step={50}
+                  onValueChange={(v) => setRenderSamples(v[0] ?? 100)}
+                />
+                <p className="text-[10px] text-muted-foreground mt-1">Higher samples = cleaner image, longer render.</p>
+              </div>
+            )}
+
+
+            <button
+              disabled={renderBusy}
+              onClick={async () => {
+                const api = renderCaptureRef.current;
+                if (!api) return;
+                let dims =
+                  renderResolution === "screen" ? api.getScreenSize()
+                  : renderResolution === "1080p" ? { width: 1920, height: 1080 }
+                  : renderResolution === "4k" ? { width: 3840, height: 2160 }
+                  : { width: 7680, height: 4320 };
+                if (renderEngine === "studio") {
+                  dims = {
+                    width: Math.min(dims.width, 1920),
+                    height: Math.min(dims.height, 1080),
+                  };
+                  setStudioDims(dims);
+                  setStudioOpen(true);
+                  return;
+                }
+                setRenderBusy(true);
+                // Yield a frame so the spinner paints before the heavy render.
+                await new Promise((r) => requestAnimationFrame(() => r(null)));
+                try {
+                  const url = api.executeRender(dims.width, dims.height);
+                  if (url) {
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = `render_${dims.width}x${dims.height}.png`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                  }
+                } finally {
+                  setRenderBusy(false);
+                }
+              }}
+              className="w-full h-9 rounded-md bg-primary text-primary-foreground text-xs font-semibold hover:opacity-90 disabled:opacity-60 flex items-center justify-center gap-2"
+            >
+              {renderBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
+              {renderBusy ? "Rendering…" : (renderEngine === "studio" ? "Start Studio Render" : "Export Render")}
+            </button>
+          </div>
+        )}
+
+
+
+
+
         {/* 3D right-side scene controls (slide-in panel) */}
-        {viewMode === "3D" && (
+        {(viewMode === "3D" || viewMode === "Walk") && (
           <div
             onMouseDown={(e) => e.stopPropagation()}
             className={cn(
@@ -8843,6 +9291,18 @@ export default function FloorPlanEditor() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      <StudioRenderModal
+        open={studioOpen}
+        width={studioDims.width}
+        height={studioDims.height}
+        targetSamples={renderSamples}
+        createSession={() => {
+          const api = renderCaptureRef.current;
+          if (!api) return null;
+          return api.startStudio(studioDims.width, studioDims.height);
+        }}
+        onClose={() => setStudioOpen(false)}
+      />
     </div>
     </TooltipProvider>
   );
